@@ -17,7 +17,10 @@ REM invoices while working fine on 4x6 labels.
 setlocal
 cd /d "%~dp0"
 
-call build.bat || exit /b 1
+REM Called by full path, not bare name: a machine with NoDefaultCurrentDirectoryInExePath
+REM set (common under some group policies) will not search the current directory, and the
+REM bare name fails with "'build.bat' is not recognized".
+call "%~dp0build.bat" || exit /b 1
 
 if exist build\installer rmdir /s /q build\installer
 mkdir build\installer
