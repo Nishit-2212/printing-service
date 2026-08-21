@@ -1,0 +1,40 @@
+{
+  // Printly configuration. Restart the bridge after editing.
+  // Comments are allowed in this file.
+
+  "port": 9110,
+
+  // Origins your web app is served from. An empty list accepts any origin, which is
+  // convenient on day one but should be tightened once the app URL is settled.
+  "allowedOrigins": [
+    "https://app.example.com"
+  ],
+
+  // Label printers, reached over a raw socket. "name" is what the frontend prints to.
+  //   charset     — TSPL printers are codepage-specific; change if non-ASCII text prints wrong
+  //   lineEnding  — "as-is" (default), "crlf", or "lf"; try "crlf" if a printer ignores commands
+  "printers": [
+    { "name": "pack-1", "host": "192.168.1.40", "port": 9100, "note": "MRP + carton" },
+    { "name": "pack-2", "host": "192.168.1.41", "port": 9100, "lineEnding": "crlf" }
+  ],
+
+  "connectTimeoutMs": 3000,
+
+  // How often an idle warm socket is checked for liveness. This is also what refreshes the
+  // online/offline status shown in the tray and in /printers.
+  "idleCheckMs": 30000,
+
+  // Per-printer queue depth before /print starts replying 503.
+  "queueCapacity": 1000,
+
+  // Number of recent jobs kept queryable via GET /jobs/{id}.
+  "jobHistory": 500,
+
+  // Route type:"pdf" jobs to OS printers, rasterized with PDFBox and printed via PrinterJob.
+  "documentLane": true,
+
+  // How many PDFs the document lane renders at once. Keep this at least as high as the
+  // frontend's bulk-print concurrency, or the tail of a batch queues behind rendering and
+  // overruns the caller's ?wait=. 1-16.
+  "documentThreads": 4
+}

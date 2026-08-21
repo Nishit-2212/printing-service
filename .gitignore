@@ -1,0 +1,7 @@
+build/
+*.class
+config.json
+printly.log*
+
+# javac drops one of these beside the build when compilation fails.
+javac.*.args

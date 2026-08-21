@@ -1,0 +1,13 @@
+# Normalise text to LF in the repository, so a Windows clone does not commit CRLF
+# back and show every line of every file as changed to anyone on Linux or macOS.
+* text=auto eol=lf
+
+# ...except the batch files, which MUST stay CRLF on checkout. cmd.exe parses a
+# .bat by byte offset, and an LF-only one misreads mid-line: `copy` becomes `opy`,
+# `REM` becomes `EM`, and the build dies with "'opy' is not recognized". This is
+# not cosmetic — it silently breaks build.bat and package-windows.bat.
+*.bat text eol=crlf
+
+# Vendored dependencies. Marked binary so git never tries to diff or convert them.
+*.jar binary
+*.msi binary
