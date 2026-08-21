@@ -33,6 +33,7 @@ public final class Job {
     private volatile long startedAt;
     private volatile long finishedAt;
     private volatile long renderMs = -1;
+    private volatile long setupMs = -1;
     private volatile long spoolMs = -1;
 
     public Job(String printer, String type, byte[] payload, int copies, PrintOptions options) {
@@ -89,14 +90,49 @@ public final class Job {
     /**
      * Record where a document job's time actually went.
      *
-     * <p>{@code renderMs} is parsing the PDF; {@code spoolMs} is rasterising it and handing it to
-     * the driver. They are split because they fail differently — a slow parse means a bloated PDF
-     * upstream, a slow spool means the printer or the raster density. Together they are what makes
-     * a job that overran the caller's {@code ?wait=} explicable rather than just late.
+     * <p>Three phases, split because they fail differently and are fixed in different places:
+     *
+     * <ul>
+     *   <li>{@code renderMs} — parsing the PDF. Slow means a bloated document upstream. Normally
+     *       0-2ms, so anything larger is the interesting kind of surprise.</li>
+     *   <li>{@code setupMs} — acquiring the print context and attaching the page. Slow means the
+     *       driver, or a context that could not be reused; it is ours to fix.</li>
+     *   <li>{@code spoolMs} — {@link java.awt.print.PrinterJob#print}. This is the driver and the
+     *       print head, and on a thermal printer it does not return until the label is out, so it
+     *       is mostly not ours to fix. Knowing that is the point of splitting it out.</li>
+     * </ul>
+     *
+     * <p>Queue wait is not passed in; it falls out of {@code startedAt - createdAt} and is
+     * reported as {@code queueMs}. It matters once callers stop printing one at a time: a
+     * non-zero queue wait means the printer is saturated, which is the good kind of busy.
      */
-    void timing(long renderMs, long spoolMs) {
+    void timing(long renderMs, long setupMs, long spoolMs) {
         this.renderMs = renderMs;
+        this.setupMs = setupMs;
         this.spoolMs = spoolMs;
+    }
+
+    /** One-line timing breakdown for the log; the same numbers {@link #toJson} reports. */
+    public String timingLine() {
+        StringBuilder sb = new StringBuilder(72);
+        sb.append("queue=").append(Math.max(0, queueMs())).append("ms");
+        if (renderMs >= 0) {
+            sb.append(" render=").append(renderMs).append("ms");
+        }
+        if (setupMs >= 0) {
+            sb.append(" setup=").append(setupMs).append("ms");
+        }
+        if (spoolMs >= 0) {
+            sb.append(" spool=").append(spoolMs).append("ms");
+        }
+        if (finishedAt > 0) {
+            sb.append(" total=").append(finishedAt - createdAt).append("ms");
+        }
+        return sb.toString();
+    }
+
+    private long queueMs() {
+        return startedAt > 0 ? startedAt - createdAt : 0;
     }
 
     void markPrinting() {
@@ -155,8 +191,14 @@ public final class Job {
             m.put("finishedAt", finishedAt);
             m.put("durationMs", finishedAt - createdAt);
         }
+        if (startedAt > 0) {
+            m.put("queueMs", queueMs());
+        }
         if (renderMs >= 0) {
             m.put("renderMs", renderMs);
+        }
+        if (setupMs >= 0) {
+            m.put("setupMs", setupMs);
         }
         if (spoolMs >= 0) {
             m.put("spoolMs", spoolMs);

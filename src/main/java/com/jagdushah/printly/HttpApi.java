@@ -48,8 +48,14 @@ public final class HttpApi {
         server = HttpServer.create(new InetSocketAddress(config.bindAddress, config.port), 0);
         // Without an explicit executor HttpServer runs handlers on the accept thread and
         // serialises every request, which would undo the per-printer parallelism.
+        //
+        // Sized for long polls, not for throughput. A caller that queues ahead holds one thread
+        // per unfinished job for the length of its ?wait= — the bulk print page keeps two orders
+        // in flight, which is four — plus its status poll. Eight was enough when every caller
+        // printed one document at a time and waited; it is uncomfortably close now, and a pool
+        // exhausted by waiters would stall the very /print that would free them.
         AtomicInteger n = new AtomicInteger();
-        pool = Executors.newFixedThreadPool(8, r -> {
+        pool = Executors.newFixedThreadPool(24, r -> {
             Thread t = new Thread(r, "http-" + n.incrementAndGet());
             t.setDaemon(true);
             return t;

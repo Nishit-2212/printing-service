@@ -33,8 +33,8 @@
   // Route type:"pdf" jobs to OS printers, rasterized with PDFBox and printed via PrinterJob.
   "documentLane": true,
 
-  // How many PDFs the document lane renders at once. Keep this at least as high as the
-  // frontend's bulk-print concurrency, or the tail of a batch queues behind rendering and
-  // overruns the caller's ?wait=. 1-16.
+  // Unused. The document lane runs one worker thread per printer so a batch of labels comes
+  // out in the order it was queued; separate printers still print in parallel. Kept so an
+  // existing config.json still reads cleanly. 1-16.
   "documentThreads": 4
 }

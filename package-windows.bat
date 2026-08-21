@@ -28,7 +28,7 @@ mkdir build\installer
 jpackage ^
   --type msi ^
   --name Printly ^
-  --app-version 1.0.0 ^
+  --app-version 1.0.1 ^
   --vendor "Jagdushah" ^
   --description "Local TSPL print service" ^
   --input build\dist ^

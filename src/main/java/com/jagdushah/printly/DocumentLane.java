@@ -2,15 +2,17 @@ package com.jagdushah.printly;
 
 import java.awt.print.PageFormat;
 import java.awt.print.Paper;
+import java.awt.print.PrinterException;
 import java.awt.print.PrinterJob;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -50,30 +52,47 @@ import org.apache.pdfbox.rendering.PDFRenderer;
  * approach QZ Tray takes, which is deliberate — the geometry the packing flow sends was
  * calibrated against QZ's output, and matching its renderer is what lets those numbers carry over
  * unchanged.
+ *
+ * <h2>One worker per printer</h2>
+ *
+ * <p>Jobs for a given printer run on that printer's own thread, in the order they arrived. This
+ * replaced a shared thread pool, for two reasons measured on a real pack station:
+ *
+ * <ul>
+ *   <li><b>Order.</b> A pool lets two labels for the same printer enter {@link PrinterJob#print}
+ *       at once and come out in whatever order the driver settles on. Nothing caught it while the
+ *       frontend printed strictly one label at a time and waited for each — but the whole point of
+ *       queueing ahead is to stop waiting, and a picklist whose labels are shuffled is worse than
+ *       a slow one.</li>
+ *   <li><b>Cost.</b> A thread that owns its printer can also own its {@link PrinterJob}, and
+ *       reusing that costs 0ms against 35ms for building a fresh one. See {@link Lane#context}.</li>
+ * </ul>
+ *
+ * <p>Different printers still run in parallel, which is the concurrency the packing flow actually
+ * depends on: it fires a label and an invoice together and waits for both.
  */
 public final class DocumentLane {
 
     /**
      * How long a printer enumeration is reused.
      *
-     * <p>Enumerating printers on Windows costs 100-300ms and the print path would otherwise do it
-     * twice per job — once to route, once to print. A newly attached printer takes up to this long
-     * to appear, which is under the frontend's own poll interval.
+     * <p>Mostly belt-and-braces: the JDK's own {@code Win32PrintServiceLookup} caches internally
+     * and answers a repeat call in 0.2ms, so this saves little. It is kept because the first call
+     * of a process really does cost ~40ms, and because a newly attached printer takes at most this
+     * long to appear, which is under the frontend's own poll interval.
      */
     private static final long LOOKUP_TTL_MS = 5000;
 
-    private final ExecutorService pool;
+    private final int queueCapacity;
+    private final Map<String, Lane> lanes = new ConcurrentHashMap<>();
+    private final AtomicInteger laneCount = new AtomicInteger();
 
     private volatile PrintService[] cached;
     private volatile long cachedAt;
+    private volatile boolean running = true;
 
-    public DocumentLane(int threads) {
-        AtomicInteger n = new AtomicInteger();
-        this.pool = Executors.newFixedThreadPool(threads, r -> {
-            Thread t = new Thread(r, "document-lane-" + n.incrementAndGet());
-            t.setDaemon(true);
-            return t;
-        });
+    public DocumentLane(Config config) {
+        this.queueCapacity = Math.max(1, config.queueCapacity);
         quietenPdfBox();
         warmUp();
     }
@@ -145,60 +164,179 @@ public final class DocumentLane {
 
     // ------------------------------------------------------------------ printing
 
-    public void submit(Job job) {
-        pool.execute(() -> {
-            job.markPrinting();
-            try {
-                print(job);
-                job.complete();
-            } catch (Exception e) {
-                String reason = e.getMessage() == null ? e.toString() : e.getMessage();
-                Log.warn("document job " + job.id() + " failed: " + reason);
-                job.fail(reason);
-            }
-        });
+    /**
+     * Queue a job on its printer's lane.
+     *
+     * @return false when that lane's queue is full, which the HTTP layer turns into a 503. The
+     *         caller must settle the job itself; nothing here will ever pick it up.
+     */
+    public boolean submit(Job job) {
+        if (!running) {
+            return false;
+        }
+        Lane lane = lanes.computeIfAbsent(
+                job.printer().toLowerCase(Locale.ROOT), key -> new Lane(job.printer()));
+        return lane.offer(job);
     }
 
-    private void print(Job job) throws Exception {
-        PrintService svc = find(job.printer());
-        if (svc == null) {
-            throw new PrintException("no OS printer named '" + job.printer() + "'");
+    /**
+     * Throw away every cached print context, so the next job rebuilds one.
+     *
+     * <p>The counterpart to caching a {@link PrinterJob} for the life of the process: without a
+     * way to clear it, a driver reconfigured mid-shift — a changed default stock, a re-installed
+     * printer — would keep printing against the context captured before the change, and the only
+     * fix would be restarting the service. This is what the tray's Reconnect button hangs off.
+     *
+     * <p>Queued jobs are untouched; each lane drops its context on the next loop.
+     */
+    public void reconnectAll() {
+        for (Lane lane : lanes.values()) {
+            lane.invalidate();
+        }
+    }
+
+    /**
+     * One printer, one queue, one thread, one print context.
+     *
+     * <p>Everything in here except {@link #queue} and {@link #stale} is confined to
+     * {@link #worker}. {@link PrinterJob} is not thread-safe and is never handed out.
+     */
+    private final class Lane {
+
+        private final String printer;
+        private final BlockingQueue<Job> queue;
+        private final Thread worker;
+
+        /** Set from any thread by {@link #invalidate()}; cleared only by the worker. */
+        private volatile boolean stale;
+
+        // -- worker-confined state --
+        private PrinterJob context;
+        private PrintService boundTo;
+
+        Lane(String printer) {
+            this.printer = printer;
+            this.queue = new ArrayBlockingQueue<>(queueCapacity);
+            this.worker = new Thread(this::run, "document-" + printer);
+            this.worker.setDaemon(true);
+            this.worker.start();
+            Log.info("document lane opened for '" + printer + "' ("
+                    + laneCount.incrementAndGet() + " active)");
         }
 
-        long t0 = System.currentTimeMillis();
-        try (PDDocument doc = PDDocument.load(job.payload())) {
-            int pages = doc.getNumberOfPages();
-            if (pages == 0) {
-                throw new PrintException("the PDF has no pages");
-            }
-            long renderMs = System.currentTimeMillis() - t0;
+        boolean offer(Job job) {
+            return queue.offer(job);
+        }
 
-            PrintOptions options = job.options();
+        void invalidate() {
+            stale = true;
+        }
+
+        void stop() {
+            worker.interrupt();
+        }
+
+        private void run() {
+            while (running) {
+                Job job;
+                try {
+                    job = queue.take();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                job.markPrinting();
+                try {
+                    print(job);
+                    job.complete();
+                    Log.info("document job " + job.id() + " done: printer='" + printer + "' "
+                            + kb(job) + " " + job.timingLine());
+                } catch (Exception e) {
+                    // A job that threw part-way through may have left the native print context in
+                    // a state the next job would inherit. Cheaper to rebuild than to reason about.
+                    context = null;
+                    boundTo = null;
+                    String reason = e.getMessage() == null ? e.toString() : e.getMessage();
+                    Log.warn("document job " + job.id() + " failed on '" + printer + "': " + reason);
+                    job.fail(reason);
+                }
+            }
+        }
+
+        private void print(Job job) throws Exception {
+            long t0 = System.currentTimeMillis();
+            try (PDDocument doc = PDDocument.load(job.payload())) {
+                int pages = doc.getNumberOfPages();
+                if (pages == 0) {
+                    throw new PrintException("the PDF has no pages");
+                }
+                long renderMs = System.currentTimeMillis() - t0;
+
+                long t1 = System.currentTimeMillis();
+                PrintOptions options = job.options();
+                PrinterJob pj = context();
+                pj.setJobName("printly " + job.id());
+                pj.setPrintable(
+                        new PDFPrintable(doc, scaling(options), false, (float) options.density()),
+                        pageFormat(pj, options));
+                long setupMs = System.currentTimeMillis() - t1;
+
+                long t2 = System.currentTimeMillis();
+                pj.print(attributes(job, options, pages));
+                job.timing(renderMs, setupMs, System.currentTimeMillis() - t2);
+            }
+        }
+
+        /**
+         * The lane's {@link PrinterJob}, built once and kept.
+         *
+         * <p>{@code setPrintService} costs 35ms on the TSC driver and 25ms on the receipt printer
+         * — every job, because a fresh {@code PrinterJob} has no service to compare against. Hand
+         * it the same {@link PrintService} instance it already holds and it returns in 0ms. The
+         * JDK hands back the same instances across lookups (a new array, the same elements), so
+         * the identity check below hits on every job after the first.
+         *
+         * <p>Reuse also leaves {@code previousPaper} set inside the JDK's job, which is a small
+         * bonus: a run of same-size labels stops re-pushing the paper size into the DEVMODE, and
+         * a genuine size change still trips it.
+         */
+        private PrinterJob context() throws PrintException, PrinterException {
+            if (stale) {
+                stale = false;
+                context = null;
+                boundTo = null;
+                Log.info("document lane '" + printer + "' rebuilding its print context");
+            }
+            PrintService svc = find(printer);
+            if (svc == null) {
+                context = null;
+                boundTo = null;
+                throw new PrintException("no OS printer named '" + printer + "'");
+            }
+            if (context != null && boundTo == svc) {
+                return context;
+            }
             PrinterJob pj = PrinterJob.getPrinterJob();
             pj.setPrintService(svc);
-            pj.setJobName("printly " + job.id());
-            pj.setPrintable(
-                    new PDFPrintable(doc, scaling(options), false, (float) options.density()),
-                    pageFormat(pj, options));
+            context = pj;
+            boundTo = svc;
+            return pj;
+        }
 
-            long t1 = System.currentTimeMillis();
-            pj.print(attributes(job, options, pages));
-            job.timing(renderMs, System.currentTimeMillis() - t1);
+        private String kb(Job job) {
+            return String.format(Locale.ROOT, "%.1fKB", job.payload().length / 1024.0);
         }
     }
 
     /**
      * Build the page geometry.
      *
-     * <p>Starts from the driver's own default page so that a field the caller left out keeps the
-     * driver's behaviour — the invoice profiles rely on that for orientation.
-     *
      * <p>{@link PrinterJob#validatePage} is deliberately never called. It clamps a page to the
      * media the driver advertises, which would quietly turn a 4x6 label into Letter on any driver
      * whose stock list does not happen to include it.
      */
     private static PageFormat pageFormat(PrinterJob pj, PrintOptions o) {
-        PageFormat pf = pj.defaultPage();
+        PageFormat pf = basePage(pj, o);
         if (!o.hasSize() && !o.hasMargins()) {
             applyOrientation(pf, o);
             return pf;
@@ -231,6 +369,26 @@ public final class DocumentLane {
         pf.setPaper(paper);
         applyOrientation(pf, o);
         return pf;
+    }
+
+    /**
+     * Where the page starts from: the driver's default, or a blank sheet when nothing of the
+     * driver's would survive.
+     *
+     * <p>{@link PrinterJob#defaultPage} asks the driver for its current DEVMODE and costs 11-17ms
+     * — every call, on a fresh job or a reused one alike. It is worth paying only for what the
+     * caller left out. Two fields can come from the driver: the paper size, used as the basis for
+     * the imageable area when no size was sent, and the orientation. When the caller supplied
+     * both, every value on the default page gets overwritten below and the call bought nothing.
+     *
+     * <p>Several invoice profiles deliberately send no orientation, because the driver's own
+     * default was what matched the printed output — those keep paying for it, correctly.
+     */
+    private static PageFormat basePage(PrinterJob pj, PrintOptions o) {
+        if (o.hasSize() && o.orientation() != null) {
+            return new PageFormat();
+        }
+        return pj.defaultPage();
     }
 
     private static void applyOrientation(PageFormat pf, PrintOptions o) {
@@ -326,6 +484,11 @@ public final class DocumentLane {
      * Windows machine with a large font set that is routinely tens of seconds. Paid here it is
      * invisible; paid on the first label of the shift it overruns the caller's {@code ?wait=} and
      * returns a 202, which reads as success to a caller that only checks the HTTP status.
+     *
+     * <p>TODO: this warms PDFBox and nothing else. The print path has its own first-call cost —
+     * ~212ms for the process's first {@link PrinterJob#getPrinterJob} and ~93ms for its first
+     * {@code setPrintService} — which the first label of the shift still pays. Building a context
+     * per configured printer here would move it off the critical path.
      */
     private void warmUp() {
         Thread t = new Thread(() -> {
@@ -366,11 +529,9 @@ public final class DocumentLane {
     }
 
     public void shutdown() {
-        pool.shutdown();
-        try {
-            pool.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        running = false;
+        for (Lane lane : lanes.values()) {
+            lane.stop();
         }
     }
 }

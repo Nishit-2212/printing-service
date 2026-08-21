@@ -29,7 +29,7 @@ public final class PrintRouter {
         for (PrinterTarget target : config.printers) {
             byName.put(target.name().toLowerCase(Locale.ROOT), new PrinterConnection(target, config));
         }
-        this.documents = config.documentLane ? new DocumentLane(config.documentThreads) : null;
+        this.documents = config.documentLane ? new DocumentLane(config) : null;
         this.jobs = new JobRegistry(config.jobHistory);
     }
 
@@ -76,7 +76,14 @@ public final class PrintRouter {
             }
             Job job = new Job(printerName, type, payload, copies, options);
             jobs.put(job);
-            documents.submit(job);
+            if (!documents.submit(job)) {
+                String reason = "document queue for '" + printerName
+                        + "' is full — printer is not keeping up";
+                // Settle it here, exactly as the label lane does: a job left QUEUED after the
+                // caller got an exception is one nothing will ever pick up or time out.
+                job.fail(reason);
+                throw new RejectedException(503, reason);
+            }
             return job;
         }
         PrinterConnection connection = label(printerName);
@@ -123,6 +130,11 @@ public final class PrintRouter {
 
     public void reconnectAll() {
         byName.values().forEach(PrinterConnection::reconnect);
+        if (documents != null) {
+            // The document lane has no socket to drop, but it does cache a print context per
+            // printer. A driver reconfigured mid-shift would otherwise need a service restart.
+            documents.reconnectAll();
+        }
     }
 
     public void shutdown() {

@@ -42,9 +42,11 @@ public final class Config {
         this.jobHistory = (int) Json.num(root, "jobHistory", 500);
         this.maxBodyBytes = (int) Json.num(root, "maxBodyBytes", 8 * 1024 * 1024);
         this.documentLane = Json.bool(root, "documentLane", true);
-        // Four by default because that is the bulk-print concurrency the packing page uses: a
-        // narrower pool makes the last jobs of a batch queue behind rendering, overrun the
-        // caller's ?wait= and come back as a 202 the caller cannot tell from success.
+        // No longer used. The document lane runs one worker thread per printer, which is what
+        // keeps a run of labels in the order they were queued; a shared pool could not promise
+        // that. Different printers still print in parallel, which is the concurrency the packing
+        // page actually needs. Still parsed so an existing config.json is not suddenly "wrong",
+        // and still reported by /health for anyone diffing a station's settings.
         this.documentThreads = clamp((int) Json.num(root, "documentThreads", 4), 1, 16);
 
         Set<String> origins = new LinkedHashSet<>();
@@ -268,8 +270,8 @@ public final class Config {
                   // Route type:"pdf" jobs to OS printers, rasterized with PDFBox.
                   "documentLane": true,
 
-                  // How many PDFs the document lane renders at once. Keep this at least as high
-                  // as the frontend's bulk-print concurrency. 1-16.
+                  // Unused since the document lane went to one worker per printer. Kept so an
+                  // upgraded station's config still reads cleanly. 1-16.
                   "documentThreads": 4
                 }
                 """;
