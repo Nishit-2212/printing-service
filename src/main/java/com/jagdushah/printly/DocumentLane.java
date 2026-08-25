@@ -276,9 +276,14 @@ public final class DocumentLane {
                 PrintOptions options = job.options();
                 PrinterJob pj = context();
                 pj.setJobName("printly " + job.id());
+                // center=false pins the content to the top-left of the imageable area, which is
+                // what QZ did: its PDFWrapper passes center=false explicitly. PDFBox's
+                // four-argument constructor defaults it to true, and centring shifts the artwork
+                // on any profile whose margins are asymmetric — the Flipkart label's left 0.3in
+                // against right 0 is exactly that, and the shift lands on the barcode.
                 pj.setPrintable(
-                        new PDFPrintable(doc, scaling(options), false, (float) options.density()),
-                        pageFormat(pj, options));
+                        new PDFPrintable(doc, scaling(options), false, (float) options.density(), false),
+                        pageFormat(pj, options, doc));
                 long setupMs = System.currentTimeMillis() - t1;
 
                 long t2 = System.currentTimeMillis();
@@ -334,11 +339,15 @@ public final class DocumentLane {
      * <p>{@link PrinterJob#validatePage} is deliberately never called. It clamps a page to the
      * media the driver advertises, which would quietly turn a 4x6 label into Letter on any driver
      * whose stock list does not happen to include it.
+     *
+     * <p>The document is needed because orientation can depend on it: see
+     * {@link #applyOrientation}.
      */
-    private static PageFormat pageFormat(PrinterJob pj, PrintOptions o) {
+    private static PageFormat pageFormat(PrinterJob pj, PrintOptions o, PDDocument doc) {
         PageFormat pf = basePage(pj, o);
-        if (!o.hasSize() && !o.hasMargins()) {
-            applyOrientation(pf, o);
+        boolean sized = o.hasSize() || o.hasMargins();
+        if (!sized) {
+            applyOrientation(pf, o, doc, false);
             return pf;
         }
 
@@ -367,7 +376,7 @@ public final class DocumentLane {
 
         paper.setImageableArea(left, top, width - left - right, height - top - bottom);
         pf.setPaper(paper);
-        applyOrientation(pf, o);
+        applyOrientation(pf, o, doc, true);
         return pf;
     }
 
@@ -381,8 +390,10 @@ public final class DocumentLane {
      * the imageable area when no size was sent, and the orientation. When the caller supplied
      * both, every value on the default page gets overwritten below and the call bought nothing.
      *
-     * <p>Several invoice profiles deliberately send no orientation, because the driver's own
-     * default was what matched the printed output — those keep paying for it, correctly.
+     * <p>Several invoice profiles deliberately send no orientation. That does not mean the driver
+     * decides: {@link #autoLandscape} reads the orientation off the PDF, exactly as QZ did. The
+     * default page is still worth fetching for them, because its paper is what the auto-detect
+     * measures the document against.
      */
     private static PageFormat basePage(PrinterJob pj, PrintOptions o) {
         if (o.hasSize() && o.orientation() != null) {
@@ -391,10 +402,22 @@ public final class DocumentLane {
         return pj.defaultPage();
     }
 
-    private static void applyOrientation(PageFormat pf, PrintOptions o) {
+    /**
+     * Set the page orientation the way QZ Tray did.
+     *
+     * <p>An explicit {@code orientation} always wins. When the caller sends none, QZ did
+     * <em>not</em> fall through to the driver — it inspected the PDF and flipped the page to
+     * landscape itself, in {@code PrintPDF.print}. An earlier version of this method read the
+     * absent value as "leave it to the driver" and stated so in a comment, which is what silently
+     * turned the Flipkart invoice upright: its page is 595x455.7pt, landscape, and QZ had been
+     * rotating it onto the 4x10in strip all along.
+     *
+     * @param sized whether the caller's geometry was applied to the paper, which is the only case
+     *              where the landscape swap below has a rectangle worth swapping
+     */
+    private static void applyOrientation(PageFormat pf, PrintOptions o, PDDocument doc, boolean sized) {
         if (o.orientation() == null) {
-            // Several invoice profiles send no orientation on purpose: the driver's own default
-            // was what matched the printed output.
+            autoLandscape(pf, doc);
             return;
         }
         pf.setOrientation(switch (o.orientation()) {
@@ -402,25 +425,100 @@ public final class DocumentLane {
             case LANDSCAPE -> PageFormat.LANDSCAPE;
             case REVERSE_LANDSCAPE -> PageFormat.REVERSE_LANDSCAPE;
         });
+        if (sized && o.orientation() != PrintOptions.Orientation.PORTRAIT) {
+            swapImageableArea(pf);
+        }
+    }
+
+    /**
+     * QZ's auto-landscape detection, ported as-is:
+     *
+     * <pre>{@code
+     * if ((page.getImageableHeight() > page.getImageableWidth()
+     *         && bounds.getWidth() > bounds.getHeight())
+     *         ^ (pd.getRotation() / 90) % 2 == 1) {
+     *     page.setOrientation(LANDSCAPE);
+     * }
+     * }</pre>
+     *
+     * <p>The exclusive-or is what makes it read right: a landscape page on portrait paper needs
+     * the flip, and so does a portrait page carrying {@code /Rotate 90}, but a landscape page that
+     * is <em>also</em> quarter-turned is already upright and must be left alone. PDFBox normalises
+     * {@code /Rotate} into [0,360), so the division cannot go negative here.
+     *
+     * <p>{@link PDPage#getBBox()} rather than the media box, again because that is what QZ read.
+     *
+     * <p>QZ evaluated this per page against one shared {@code PageFormat} and only ever latched
+     * landscape on, never off. This lane binds a single format to the whole document through
+     * {@link PrinterJob#setPrintable}, so it cannot vary per page at all; scanning until the first
+     * page that asks for the flip is the same answer for every document the packing flow prints,
+     * all of which are single-page by the time they arrive.
+     */
+    private static void autoLandscape(PageFormat pf, PDDocument doc) {
+        boolean portraitPaper = pf.getImageableHeight() > pf.getImageableWidth();
+        for (PDPage page : doc.getPages()) {
+            PDRectangle bounds = page.getBBox();
+            boolean landscapeSource = bounds.getWidth() > bounds.getHeight();
+            boolean quarterTurned = (page.getRotation() / 90) % 2 == 1;
+            if ((portraitPaper && landscapeSource) ^ quarterTurned) {
+                pf.setOrientation(PageFormat.LANDSCAPE);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Transpose the imageable rectangle, which QZ did for every non-portrait orientation on top of
+     * {@code setOrientation}.
+     *
+     * <p>Java already reports a landscape page's imageable width and height swapped, so doing it
+     * again on the paper looks redundant and is arguably a QZ bug — but the Meesho label
+     * (6x5.7in) and the merged Flipkart/Meesho invoice (8.5x7.5in) were both calibrated on real
+     * output with the swap in place, and undoing it silently transposes their printable area.
+     *
+     * <p>Not replicated: QZ applied this once per page of the document, so an even page count
+     * swapped it back to where it started. Every profile that reaches here is single-page, which
+     * is why nobody noticed; doing it once is the behaviour those labels were actually tuned
+     * against.
+     */
+    private static void swapImageableArea(PageFormat pf) {
+        Paper paper = pf.getPaper();
+        paper.setImageableArea(paper.getImageableX(), paper.getImageableY(),
+                paper.getImageableHeight(), paper.getImageableWidth());
+        pf.setPaper(paper);
     }
 
     /**
      * Map the caller's scale onto PDFBox's.
      *
-     * <p>UNVERIFIED AGAINST HARDWARE. This mirrors what QZ Tray's names meant, but the sizes the
-     * packing flow sends were tuned by looking at real labels, so this mapping has to be confirmed
-     * the same way — one physical print per platform and document type — before it is trusted.
-     * {@code fit} is the interesting one: it is read here as "shrink if oversized, never enlarge",
-     * and it is the only setting the Flipkart label profile uses.
+     * <p>QZ Tray had no {@code scale} option at all. It had a boolean {@code scaleContent},
+     * defaulting to true, and consumed it in one line:
+     *
+     * <pre>{@code
+     * Scaling scale = (pxlOpts.isScaleContent()? Scaling.SCALE_TO_FIT:Scaling.ACTUAL_SIZE);
+     * }</pre>
+     *
+     * <p>So every {@code scale}, {@code fit-to-page} and {@code fitToPage} key the packing flow
+     * ever sent QZ was discarded, and every PDF it printed was scaled to fill the page. The
+     * calibrated sizes upstream were tuned against that, which is why the three names below
+     * collapse onto two behaviours: anything that is not {@code actual} fills the page.
+     *
+     * <p>This costs the one thing QZ could not express either — a genuine shrink-only fit, which
+     * would leave an undersized label at its own size instead of enlarging it. Reading {@code fit}
+     * that way is what printed the Flipkart label small: its page is 215x360.3pt inside a
+     * 266.4x417.6pt imageable area, so shrink-to-fit had nothing to shrink and QZ's ~1.16x
+     * enlargement disappeared. Adding a fourth name for shrink-only is the way back, once
+     * something actually wants it.
      */
     private static Scaling scaling(PrintOptions o) {
         if (o.scale() == null) {
-            return Scaling.SHRINK_TO_FIT; // PDFBox's own default
+            // QZ's default, not PDFBox's: scaleContent defaulted to true, so an options object
+            // that says nothing about scale still filled the page.
+            return Scaling.SCALE_TO_FIT;
         }
         return switch (o.scale()) {
             case ACTUAL -> Scaling.ACTUAL_SIZE;
-            case FIT -> Scaling.SHRINK_TO_FIT;
-            case FIT_TO_PAGE -> Scaling.SCALE_TO_FIT;
+            case FIT, FIT_TO_PAGE -> Scaling.SCALE_TO_FIT;
         };
     }
 
