@@ -25,10 +25,16 @@ call "%~dp0build.bat" || exit /b 1
 if exist build\installer rmdir /s /q build\installer
 mkdir build\installer
 
+REM Fixed across every build on purpose: this is what lets Windows Installer treat a
+REM new --app-version as an upgrade of the old one instead of a conflicting product
+REM with the same name. Never regenerate it.
+set "UPGRADE_UUID=bcab9fe6-fbdd-4ff0-a1fc-bf9972911158"
+
 jpackage ^
   --type msi ^
   --name Printly ^
-  --app-version 1.0.1 ^
+  --app-version 1.0.4 ^
+  --win-upgrade-uuid %UPGRADE_UUID% ^
   --vendor "Jagdushah" ^
   --description "Local TSPL print service" ^
   --input build\dist ^

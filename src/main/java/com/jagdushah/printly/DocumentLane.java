@@ -1,5 +1,6 @@
 package com.jagdushah.printly;
 
+import java.awt.geom.Rectangle2D;
 import java.awt.print.PageFormat;
 import java.awt.print.Paper;
 import java.awt.print.PrinterException;
@@ -23,6 +24,8 @@ import javax.print.PrintServiceLookup;
 import javax.print.attribute.HashPrintRequestAttributeSet;
 import javax.print.attribute.PrintRequestAttributeSet;
 import javax.print.attribute.standard.Chromaticity;
+import javax.print.attribute.standard.Media;
+import javax.print.attribute.standard.MediaPrintableArea;
 import javax.print.attribute.standard.Copies;
 import javax.print.attribute.standard.JobName;
 import javax.print.attribute.standard.PageRanges;
@@ -152,6 +155,58 @@ public final class DocumentLane {
         return null;
     }
 
+    /**
+     * Ask a driver what it can actually mark on the media it has loaded.
+     *
+     * <p>Queried with the printer's own default {@code Media} attached, because the printable area
+     * is per-stock: without it a driver answers for whatever it considers its default, which on a
+     * label printer is rarely the roll that is loaded.
+     *
+     * <p>Returns the largest rectangle offered when a driver offers several. Some drivers answer
+     * with one entry per stock and there is no better discriminator available here; the largest is
+     * the one that does not needlessly shrink output.
+     */
+    private static Rectangle2D lookupPrintableArea(PrintService svc) {
+        if (svc == null) {
+            return null;
+        }
+        try {
+            PrintRequestAttributeSet request = new HashPrintRequestAttributeSet();
+            Media media = (Media) svc.getDefaultAttributeValue(Media.class);
+            if (media != null) {
+                request.add(media);
+            }
+            Object value = svc.getSupportedAttributeValues(MediaPrintableArea.class, null, request);
+            MediaPrintableArea best = null;
+            if (value instanceof MediaPrintableArea single) {
+                best = single;
+            } else if (value instanceof MediaPrintableArea[] all) {
+                for (MediaPrintableArea candidate : all) {
+                    if (best == null || area(candidate) > area(best)) {
+                        best = candidate;
+                    }
+                }
+            }
+            if (best == null) {
+                return null;
+            }
+            return new Rectangle2D.Double(
+                    best.getX(MediaPrintableArea.INCH) * 72.0,
+                    best.getY(MediaPrintableArea.INCH) * 72.0,
+                    best.getWidth(MediaPrintableArea.INCH) * 72.0,
+                    best.getHeight(MediaPrintableArea.INCH) * 72.0);
+        } catch (RuntimeException e) {
+            // Not every driver answers this, and a refusal is not a reason to fail the job: the
+            // sheet is still a bound, it is just a more generous one.
+            Log.warn("could not read the printable area of '" + svc.getName() + "': " + e);
+            return null;
+        }
+    }
+
+    private static float area(MediaPrintableArea m) {
+        return m.getWidth(MediaPrintableArea.INCH) * m.getHeight(MediaPrintableArea.INCH);
+    }
+
     private static boolean acceptingJobs(PrintService svc) {
         try {
             PrinterIsAcceptingJobs a = svc.getAttribute(PrinterIsAcceptingJobs.class);
@@ -213,6 +268,9 @@ public final class DocumentLane {
         // -- worker-confined state --
         private PrinterJob context;
         private PrintService boundTo;
+        private PageFormat driverPage;
+        private Rectangle2D printableArea;
+        private boolean printableAreaResolved;
 
         Lane(String printer) {
             this.printer = printer;
@@ -283,7 +341,7 @@ public final class DocumentLane {
                 // against right 0 is exactly that, and the shift lands on the barcode.
                 pj.setPrintable(
                         new PDFPrintable(doc, scaling(options), false, (float) options.density(), false),
-                        pageFormat(pj, options, doc));
+                        pageFormat(driverPage(), printableArea(), options, doc));
                 long setupMs = System.currentTimeMillis() - t1;
 
                 long t2 = System.currentTimeMillis();
@@ -310,12 +368,14 @@ public final class DocumentLane {
                 stale = false;
                 context = null;
                 boundTo = null;
+                forgetPageCache();
                 Log.info("document lane '" + printer + "' rebuilding its print context");
             }
             PrintService svc = find(printer);
             if (svc == null) {
                 context = null;
                 boundTo = null;
+                forgetPageCache();
                 throw new PrintException("no OS printer named '" + printer + "'");
             }
             if (context != null && boundTo == svc) {
@@ -325,7 +385,61 @@ public final class DocumentLane {
             pj.setPrintService(svc);
             context = pj;
             boundTo = svc;
+            forgetPageCache();
             return pj;
+        }
+
+        private void forgetPageCache() {
+            driverPage = null;
+            printableArea = null;
+            printableAreaResolved = false;
+        }
+
+        /**
+         * What the head can physically mark on the loaded media, in points on the sheet.
+         *
+         * <p>Cached with the same lifetime as {@link #driverPage}: it is a driver query, and it
+         * changes for the same reasons the default page does — a different stock, a reinstalled
+         * printer — both of which drop the print context anyway.
+         *
+         * @return the printable rectangle, or null when the driver advertises none, in which case
+         *         the sheet is the only bound available
+         */
+        private Rectangle2D printableArea() throws PrintException, PrinterException {
+            context();
+            if (printableAreaResolved) {
+                return printableArea;
+            }
+            printableAreaResolved = true;
+            printableArea = lookupPrintableArea(boundTo);
+            if (printableArea == null) {
+                Log.info("printer '" + printer + "' advertises no printable area; "
+                        + "bounding output by the sheet alone");
+            }
+            return printableArea;
+        }
+
+        /**
+         * The printer's own page — its paper is the media actually loaded.
+         *
+         * <p>Cached because {@link PrinterJob#defaultPage} asks the driver for its current DEVMODE
+         * and costs 11-17ms every call, on a fresh job or a reused one alike. Every document job
+         * needs it now that the caller's {@code size} sets the printable rectangle rather than the
+         * sheet, so paying it per job would be 11-17ms added to each label of a picklist.
+         *
+         * <p>Dropped whenever the print context is, which is what the tray's Reconnect button
+         * hangs off: a driver reconfigured mid-shift — a changed default stock, a re-installed
+         * printer — must not keep being measured against the page captured before the change.
+         *
+         * <p>A copy is handed out every time. {@link PageFormat} is mutable and
+         * {@link #pageFormat} writes all over the one it is given.
+         */
+        private PageFormat driverPage() throws PrintException, PrinterException {
+            PrinterJob pj = context();
+            if (driverPage == null) {
+                driverPage = pj.defaultPage();
+            }
+            return (PageFormat) driverPage.clone();
         }
 
         private String kb(Job job) {
@@ -334,72 +448,140 @@ public final class DocumentLane {
     }
 
     /**
-     * Build the page geometry.
+     * Build the page geometry: the caller's rectangle, on the media the printer actually holds.
      *
-     * <p>{@link PrinterJob#validatePage} is deliberately never called. It clamps a page to the
-     * media the driver advertises, which would quietly turn a 4x6 label into Letter on any driver
-     * whose stock list does not happen to include it.
+     * <h2>The paper is the driver's, never the caller's</h2>
      *
-     * <p>The document is needed because orientation can depend on it: see
-     * {@link #applyOrientation}.
+     * <p>{@code size} sets the <em>printable rectangle</em>, not the sheet. An earlier version
+     * read it as the sheet and called {@link Paper#setSize}, which is the one place this lane
+     * diverged from QZ Tray badly enough to be visible on paper: the Flipkart invoice profile is
+     * 4x10in, so a pack station with both printers pointed at its 4x6 label roll was asking the
+     * TSC to feed ten inches, and one order came out over three labels instead of two.
+     *
+     * <p>QZ never overrode the sheet on the PDF path. It put the geometry into a
+     * {@code MediaPrintableArea} and let {@link PrinterJob#getPageFormat} resolve it, which keeps
+     * the driver's own stock as the paper — measured on a TSC TE244 configured for 4.10x6.00in:
+     *
+     * <pre>
+     * getPageFormat(MediaPrintableArea 4x10in)  -> paper 4.10x6.00in, imageable 2.10x4.00in
+     * getPageFormat(MediaPrintableArea 4x6in inset 0.3/0.1)
+     *                                           -> paper 4.10x6.00in, imageable 3.70x5.80in
+     * </pre>
+     *
+     * <p>The second line is the label profile, and it is exactly what this method computes, which
+     * is why labels never diverged and only the invoices did.
+     *
+     * <h2>Oversized rectangles are clamped, not dropped</h2>
+     *
+     * <p>The first line above is the JDK dropping a rectangle that does not fit the media and
+     * falling back to its own one-inch inset — it does that for anything without slack, an exact
+     * 4x6 on 4.10x6.00 included. So QZ printed the invoice into a 2.10x4.00in box adrift in the
+     * middle of the label. That is not worth reproducing: this lane clamps instead, so a 4x10in
+     * invoice fills the 4x6 label rather than shrinking into the centre of it. Page count matches
+     * QZ, legibility beats it.
+     *
+     * <h2>Clamped to what the head can actually mark</h2>
+     *
+     * <p>Not to the sheet — to the printable area the driver advertises for the loaded media,
+     * which is usually smaller. The TSC TE244 reports {@code x=0.049in, y=0, 4.000x6.000in} on a
+     * 4.098in-wide roll: a 1.25mm strip down the left edge its head cannot reach. Zero margins
+     * clamped to the sheet put content into that strip, and because the invoice profiles print
+     * landscape, the sheet's left edge is the top of the rotated page — so the invoice came out
+     * with its top millimetre shaved off.
+     *
+     * <p>"Full bleed" therefore means as much of the sheet as the hardware can mark, which is the
+     * only reading a printer can honour. A driver that advertises nothing falls back to the sheet.
+     *
+     * <p>{@link PrinterJob#validatePage} is still never called. Clamping to the advertised
+     * printable area is exactly as much driver-conformance as is wanted; validatePage goes further
+     * and snaps the whole page onto an advertised stock, which turns a 4x6 label into Letter on
+     * any driver whose list does not happen to include it.
+     *
+     * @param driverPage the printer's own page, from {@link Lane#driverPage()}; its paper is the
+     *                   loaded media and is what decides how far the printer feeds
+     * @param printable  what the head can mark, in points on the sheet, or null if unadvertised
+     * @param doc        needed because orientation can depend on it, see {@link #applyOrientation}
      */
-    private static PageFormat pageFormat(PrinterJob pj, PrintOptions o, PDDocument doc) {
-        PageFormat pf = basePage(pj, o);
-        boolean sized = o.hasSize() || o.hasMargins();
-        if (!sized) {
-            applyOrientation(pf, o, doc, false);
-            return pf;
+    private static PageFormat pageFormat(PageFormat driverPage, Rectangle2D printable,
+            PrintOptions o, PDDocument doc) {
+        if (!o.hasSize() && !o.hasMargins()) {
+            applyOrientation(driverPage, o, doc, false);
+            return driverPage;
         }
 
-        Paper paper = pf.getPaper();
-        if (o.hasSize()) {
-            paper.setSize(o.widthPt(), o.heightPt());
-        }
+        Paper paper = driverPage.getPaper();
+        double pageWidth = paper.getWidth();
+        double pageHeight = paper.getHeight();
 
-        // Java gives every Paper a one-inch imageable margin on all four sides by default. Left
-        // alone that crushes a 4x6 label into the middle of the media and puts the barcode
-        // somewhere the courier's scanner will not find it, so the printable area is always set
-        // explicitly — zero margins meaning full bleed, which is what a thermal label wants.
-        double width = paper.getWidth();
-        double height = paper.getHeight();
         double left = o.hasMargins() ? o.marginLeftPt() : 0;
         double top = o.hasMargins() ? o.marginTopPt() : 0;
         double right = o.hasMargins() ? o.marginRightPt() : 0;
         double bottom = o.hasMargins() ? o.marginBottomPt() : 0;
 
+        // Absent size means "the whole sheet", which is the only reading left once the sheet is
+        // the driver's: margins alone then inset the media, as they always did.
+        double width = (o.hasSize() ? o.widthPt() : pageWidth) - left - right;
+        double height = (o.hasSize() ? o.heightPt() : pageHeight) - top - bottom;
+
         // PrintOptions already checks margins against an explicit size. This catches the other
         // case: margins sent without a size, measured against whatever paper the driver reports.
-        if (width - left - right <= 0 || height - top - bottom <= 0) {
+        if (width <= 0 || height <= 0) {
             throw new IllegalArgumentException("margins leave no printable area on the "
-                    + Math.round(width) + "x" + Math.round(height) + "pt page this printer reports");
+                    + Math.round(pageWidth) + "x" + Math.round(pageHeight)
+                    + "pt page this printer reports");
         }
 
-        paper.setImageableArea(left, top, width - left - right, height - top - bottom);
-        pf.setPaper(paper);
-        applyOrientation(pf, o, doc, true);
-        return pf;
+        // Java gives every Paper a one-inch imageable margin on all four sides by default. Left
+        // alone that crushes a 4x6 label into the middle of the media and puts the barcode
+        // somewhere the courier's scanner will not find it, so the printable area is always set
+        // explicitly — zero margins meaning as much of the sheet as the head can mark.
+        Paper sized = driverPage.getPaper();
+        sized.setImageableArea(left, top, width, height);
+        driverPage.setPaper(sized);
+        clampImageable(driverPage, printable);
+
+        applyOrientation(driverPage, o, doc, true);
+        // Again after orientation: swapImageableArea transposes the rectangle, which can push a
+        // landscape profile back off a sheet narrower than that profile is tall.
+        clampImageable(driverPage, printable);
+        return driverPage;
     }
 
     /**
-     * Where the page starts from: the driver's default, or a blank sheet when nothing of the
-     * driver's would survive.
+     * Pull the printable rectangle back inside what the printer can mark.
      *
-     * <p>{@link PrinterJob#defaultPage} asks the driver for its current DEVMODE and costs 11-17ms
-     * — every call, on a fresh job or a reused one alike. It is worth paying only for what the
-     * caller left out. Two fields can come from the driver: the paper size, used as the basis for
-     * the imageable area when no size was sent, and the orientation. When the caller supplied
-     * both, every value on the default page gets overwritten below and the call bought nothing.
+     * <p>Two jobs. Bounding it by the sheet is what makes a 4x10in invoice profile land on a 4x6
+     * label instead of asking for ten inches of stock — hand a thermal printer a page taller than
+     * its media and it simply keeps feeding. Bounding it by the advertised printable area is what
+     * stops content being placed in a margin the head cannot reach, which is otherwise silently
+     * shaved off the edge.
      *
-     * <p>Several invoice profiles deliberately send no orientation. That does not mean the driver
-     * decides: {@link #autoLandscape} reads the orientation off the PDF, exactly as QZ did. The
-     * default page is still worth fetching for them, because its paper is what the auto-detect
-     * measures the document against.
+     * @param printable the head's reach in points on the sheet, or null when unadvertised
      */
-    private static PageFormat basePage(PrinterJob pj, PrintOptions o) {
-        if (o.hasSize() && o.orientation() != null) {
-            return new PageFormat();
+    private static void clampImageable(PageFormat pf, Rectangle2D printable) {
+        Paper paper = pf.getPaper();
+        double minX = 0;
+        double minY = 0;
+        double maxX = paper.getWidth();
+        double maxY = paper.getHeight();
+        if (printable != null) {
+            // Intersect rather than replace: a driver that over-reports must not be able to grow
+            // the area beyond the sheet the feed is measured against.
+            minX = Math.max(minX, printable.getMinX());
+            minY = Math.max(minY, printable.getMinY());
+            maxX = Math.min(maxX, printable.getMaxX());
+            maxY = Math.min(maxY, printable.getMaxY());
         }
-        return pj.defaultPage();
+        double x = clamp(paper.getImageableX(), minX, maxX);
+        double y = clamp(paper.getImageableY(), minY, maxY);
+        paper.setImageableArea(x, y,
+                Math.min(paper.getImageableWidth(), maxX - x),
+                Math.min(paper.getImageableHeight(), maxY - y));
+        pf.setPaper(paper);
+    }
+
+    private static double clamp(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     /**

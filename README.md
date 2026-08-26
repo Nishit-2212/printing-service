@@ -110,7 +110,7 @@ invoice profiles rely on.
 
 | Field | Accepted |
 |-------|----------|
-| `size` | positive `width`/`height`; `units` is `in` (default), `mm`, `cm` or `pt` |
+| `size` | the **printable rectangle**, not the sheet — see below. Positive `width`/`height`; `units` is `in` (default), `mm`, `cm` or `pt` |
 | `margins` | `top`/`right`/`bottom`/`left`, same units as `size`, never negative |
 | `orientation` | `portrait`, `landscape`, `reverse-landscape` |
 | `colorType` | `color`, `grayscale`, `blackwhite` |
@@ -126,9 +126,24 @@ Unrecognised keys (QZ-only ones like `scaleContent`) are ignored.
 Only a single range is accepted for `pageRange`, on purpose: `PrinterJob` honours just the first
 range it is given, so taking a list like `1,4-5` would quietly print page 1 alone.
 
-Margins are applied as the page's imageable area. Java gives every page a one-inch inset by
-default, so zero margins here means genuine full bleed rather than a label crushed into the middle
-of the media.
+##### `size` sets the printable area, not the paper
+
+The sheet is always the media the driver has loaded. `size` and `margins` together describe the
+rectangle drawn **on** that sheet, and a rectangle bigger than the sheet is clamped to it.
+
+This matters because the sheet is what decides how far a printer feeds. Reading `size` as the
+paper instead — which an earlier build did — meant the 4x10in Flipkart invoice profile asked a
+4x6 label roll for ten inches of stock, and one order came out over three labels instead of two.
+
+It is also what QZ Tray did on its PDF path: it never overrode the sheet, it put the geometry into
+a `MediaPrintableArea` and let `PrinterJob.getPageFormat` resolve it against the driver's stock.
+The one QZ behaviour deliberately *not* copied is what the JDK does with a rectangle that does not
+fit — it discards it and falls back to its own one-inch inset, for anything without slack, an exact
+4x6 on a 4.10x6.00 media included. That printed the invoice as a 2.10x4.00in block adrift in the
+middle of the label. Clamping keeps the page count identical and fills the label instead.
+
+Java gives every page a one-inch inset by default, so zero margins here means genuine full bleed
+rather than a label crushed into the middle of the media.
 
 Returns **202** immediately with a `jobId`. Add `?wait=<ms>` to block until the label really
 prints — then you get **200** on success or **502** with an `error`, which is what you want while
