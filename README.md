@@ -410,6 +410,8 @@ src/main/java/com/jagdushah/printly/
   Json.java               dependency-free JSON reader/writer
 lib/                      vendored jars, committed — see below
 tools/MockPrinter.java    fake TSPL printer for testing without hardware
+tools/GeometryCheck.java  the calibrated profiles, asserted against measured
+                          printer geometry — no hardware, exits non-zero on drift
 ```
 
 One third-party dependency, and only for the document lane: **Apache PDFBox 2.0.x**

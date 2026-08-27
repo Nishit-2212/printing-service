@@ -111,26 +111,52 @@ public final class ResolvedPage {
     /**
      * Build the page geometry: the caller's rectangle, on the media the printer actually holds.
      *
-     * <h2>The paper is the driver's, never the caller's</h2>
+     * <h2>The paper is the driver's, never the caller's — and this is a deliberate divergence</h2>
      *
-     * <p>{@code size} sets the <em>printable rectangle</em>, not the sheet. An earlier version
-     * read it as the sheet and called {@link Paper#setSize}, which is the one place this lane
-     * diverged from QZ Tray badly enough to be visible on paper: the Flipkart invoice profile is
-     * 4x10in, so a pack station with both printers pointed at its 4x6 label roll was asking the
-     * TSC to feed ten inches, and one order came out over three labels instead of two.
+     * <p>{@code size} sets the <em>printable rectangle</em>, not the sheet, unless
+     * {@code sizeMeans: "sheet"} says otherwise. An earlier version read it as the sheet
+     * unconditionally and called {@link Paper#setSize}, and the Flipkart invoice profile is 4x10in
+     * — so a pack station with both printers pointed at its 4x6 label roll was asking the TSC to
+     * feed ten inches, and one order came out over three labels instead of two.
      *
-     * <p>QZ never overrode the sheet on the PDF path. It put the geometry into a
-     * {@code MediaPrintableArea} and let {@code PrinterJob.getPageFormat} resolve it, which keeps
-     * the driver's own stock as the paper — measured on a TSC TE244 configured for 4.10x6.00in:
+     * <p>An earlier version of this comment claimed QZ Tray never overrode the sheet, and that the
+     * numbers below were what QZ resolved. <b>That was wrong.</b> Disassembling the installed
+     * {@code qz-tray.jar} ({@code qz.printer.action.PrintPixel.applyDefaultSettings}) shows QZ
+     * doing exactly what this lane refuses to do:
+     *
+     * <pre>{@code
+     * if (size != null && size.getWidth() > 0 && size.getHeight() > 0) {
+     *     w = size.getWidth(); h = size.getHeight();
+     *     paper.setSize(w * convert, h * convert);          // the sheet becomes the caller's
+     * }
+     * if (margins != null) { x += left; y += top; w -= left + right; h -= top + bottom; }
+     * if (w > 0 && h > 0) {
+     *     attributes.add(new MediaPrintableArea(x, y, w, h, units));
+     *     paper.setImageableArea(x * convert, y * convert, w * convert, h * convert);
+     *     page.setPaper(paper);
+     * }
+     * }</pre>
+     *
+     * <p>So QZ never clamped to the loaded media at all: it declared the caller's size to be the
+     * paper and left the driver to cope. That is why the 4x10in invoice fed three labels under QZ
+     * too, and it is also why the Meesho label — a 6x5.7in profile on a 4x6 roll — looked right
+     * under QZ and small here. QZ was not fitting it to the roll; it was telling the driver the
+     * roll was 6x5.7in.
+     *
+     * <p>Keeping the driver's sheet is still the right default: it is what stops a thermal printer
+     * feeding stock it does not have. But a profile calibrated against QZ's sheet-replacing
+     * behaviour cannot be reproduced without it, so {@code sizeMeans: "sheet"} exists as an
+     * explicit, per-profile opt back in. See {@link PrintOptions#sizeIsSheet()}.
+     *
+     * <p>For the record, measured on a TSC TE244 configured for 4.10x6.00in, this is what the
+     * {@code MediaPrintableArea} QZ also attached resolves to on its own — the driver honours it
+     * when it fits the media and silently drops it to a one-inch inset when it does not:
      *
      * <pre>
      * getPageFormat(MediaPrintableArea 4x10in)  -&gt; paper 4.10x6.00in, imageable 2.10x4.00in
      * getPageFormat(MediaPrintableArea 4x6in inset 0.3/0.1)
      *                                           -&gt; paper 4.10x6.00in, imageable 3.70x5.80in
      * </pre>
-     *
-     * <p>The second line is the label profile, and it is exactly what this method computes, which
-     * is why labels never diverged and only the invoices did.
      *
      * <h2>Oversized rectangles are clamped, not dropped</h2>
      *
@@ -181,6 +207,24 @@ public final class ResolvedPage {
             return finish(driverPage, printable, orientationSource, o, doc, notes);
         }
 
+        // QZ's sheet-replacing behaviour, opted into per profile. Done before anything is measured,
+        // because from here down "the sheet" has to mean the caller's size for every calculation —
+        // the margins inset it, the clamp bounds by it, and the preview draws it.
+        if (o.sizeIsSheet() && o.hasSize()) {
+            Paper sheet = driverPage.getPaper();
+            sheet.setSize(o.widthPt(), o.heightPt());
+            driverPage.setPaper(sheet);
+            notes.add(Note.info("size-is-sheet", String.format(Locale.ROOT,
+                    "\"sizeMeans\":\"sheet\" — the sheet was set to %.2fx%.2f in and the driver's own "
+                            + "media ignored, as QZ Tray did. The printer will feed this length "
+                            + "whether or not it is loaded.",
+                    o.widthPt() / PT_PER_IN, o.heightPt() / PT_PER_IN)));
+            // The head's reach was measured against the media this just replaced, so it no longer
+            // describes anything. QZ did not clamp to it either; dropping it is what keeps the two
+            // engines producing the same page rather than nearly the same one.
+            printable = null;
+        }
+
         Paper paper = driverPage.getPaper();
         double pageWidth = paper.getWidth();
         double pageHeight = paper.getHeight();
@@ -210,11 +254,25 @@ public final class ResolvedPage {
         Paper sized = driverPage.getPaper();
         sized.setImageableArea(left, top, width, height);
         driverPage.setPaper(sized);
-        clampImageable(driverPage, printable, notes);
 
         orientationSource = applyOrientation(driverPage, o, doc, true, notes);
-        // Again after orientation: swapImageableArea transposes the rectangle, which can push a
-        // landscape profile back off a sheet narrower than that profile is tall.
+        // Clamped once, and only after the orientation swap. It used to be clamped here and again
+        // before the swap, which quietly capped every rotated profile to a square.
+        //
+        // Worked example, the Meesho label (6x5.7in, landscape) on a 4.10x6.00in roll. Clamping
+        // first caps the width at the sheet's 288pt; swapImageableArea then transposes that cap
+        // into the *height*, and the second clamp caps the new width at 288 again — so the result
+        // is a 288x288 square whatever the profile asks for, and two thirds of the label is white.
+        // No size and no margin can escape it, because the cap is the sheet width both times.
+        //
+        // Clamping after the swap instead lets the pre-swap height become the width and the
+        // pre-swap width become the height, each bounded once: 288x432, the whole printable area.
+        //
+        // This is a no-op wherever the media already fits the profile, since nothing is clamped at
+        // all then, and elsewhere it can only widen the rectangle — the remaining clamp still
+        // bounds it by the sheet and the head. It is not a QZ behaviour either way: QZ handed the
+        // geometry to getPageFormat and let the JDK drop it, which is the fallback this lane
+        // exists to avoid.
         clampImageable(driverPage, printable, notes);
         return finish(driverPage, printable, orientationSource, o, doc, notes);
     }

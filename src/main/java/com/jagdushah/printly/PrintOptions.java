@@ -49,6 +49,7 @@ public final class PrintOptions {
     private double widthPt;
     private double heightPt;
     private boolean hasSize;
+    private boolean sizeIsSheet;
 
     private double marginTopPt;
     private double marginRightPt;
@@ -115,6 +116,25 @@ public final class PrintOptions {
                         + " is larger than any real media — check \"units\"");
             }
             o.hasSize = true;
+        }
+
+        // How "size" is to be read. Default "printable" keeps the driver's own stock as the sheet
+        // and treats size as a rectangle drawn on it; "sheet" replaces the sheet with size, which
+        // is what QZ Tray did unconditionally (see ResolvedPage.resolve). Only a profile calibrated
+        // against QZ's output should ask for it: a sheet larger than the loaded media makes a
+        // thermal printer keep feeding, which is how one order came out over three labels.
+        String sizeMeans = Json.str(m, "sizeMeans", null);
+        if (sizeMeans != null && !sizeMeans.isBlank()) {
+            o.sizeIsSheet = switch (sizeMeans.trim().toLowerCase(Locale.ROOT)) {
+                case "sheet", "paper", "media" -> true;
+                case "printable", "imageable", "area" -> false;
+                default -> throw new IllegalArgumentException("unknown \"sizeMeans\" '" + sizeMeans
+                        + "' (use printable or sheet)");
+            };
+            if (o.sizeIsSheet && !o.hasSize) {
+                throw new IllegalArgumentException(
+                        "\"sizeMeans\":\"sheet\" needs a \"size\" to make the sheet from");
+            }
         }
 
         Map<String, Object> margins = Json.obj(m.get("margins"));
@@ -225,6 +245,18 @@ public final class PrintOptions {
         return hasSize;
     }
 
+    /**
+     * True when {@code size} is the sheet rather than a rectangle drawn on the driver's sheet.
+     *
+     * <p>QZ Tray's behaviour, opted into per profile. It stops the geometry being clamped to the
+     * loaded media at all, which is the only way to reproduce a profile calibrated under QZ — and
+     * also the way to make a thermal printer feed stock it does not have, so it is off by default
+     * and stays off for anything that has not been checked against real output.
+     */
+    public boolean sizeIsSheet() {
+        return sizeIsSheet;
+    }
+
     public double widthPt() {
         return widthPt;
     }
@@ -290,6 +322,7 @@ public final class PrintOptions {
             m.put("widthPt", round(widthPt));
             m.put("heightPt", round(heightPt));
             m.put("units", units);
+            m.put("sizeMeans", sizeIsSheet ? "sheet" : "printable");
         }
         if (hasMargins) {
             m.put("marginsPt", List.of(round(marginTopPt), round(marginRightPt),
