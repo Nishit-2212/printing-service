@@ -105,6 +105,34 @@ public final class PrintRouter {
         return "pdf".equals(type) || "document".equals(type);
     }
 
+    /**
+     * Render what a document job would put on paper, without putting it there.
+     *
+     * <p>Document lane only, and deliberately so: a TSPL label carries its geometry in the command
+     * stream rather than in {@code options}, so there is no page here to compose or to preview.
+     * The honest answer for a label printer is that this endpoint does not apply to it.
+     */
+    public Map<String, Object> preview(String printerName, byte[] pdf, PrintOptions options,
+            int pageIndex, double dpi, boolean overlay) {
+        return documents(printerName).preview(printerName, pdf, options, pageIndex, dpi, overlay);
+    }
+
+    /** Resolve a profile against a printer's loaded media and report it. Prints nothing. */
+    public Map<String, Object> preflight(String printerName, byte[] pdf, PrintOptions options) {
+        return documents(printerName).preflight(printerName, pdf, options);
+    }
+
+    /** The document lane, or the same refusals {@link #submit} would have given for this printer. */
+    private DocumentLane documents(String printerName) {
+        if (documents == null) {
+            throw new RejectedException(400, "the document lane is disabled in config.json");
+        }
+        if (!documents.has(printerName)) {
+            throw new RejectedException(404, "no OS printer named '" + printerName + "'");
+        }
+        return documents;
+    }
+
     public List<Map<String, Object>> listPrinters() {
         List<Map<String, Object>> out = new ArrayList<>();
         for (PrinterConnection c : byName.values()) {

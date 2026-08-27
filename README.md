@@ -156,12 +156,79 @@ validating a new label against physical output.
 { "jobId": "j_1", "printer": "pack-1", "state": "done", "ok": true, "durationMs": 1 }
 ```
 
+### `POST /preview` — render what the printer *would* put on the label
+
+Same body as `/print` minus `copies`, plus `page` (1-based, default 1), `dpi` (default 96) and
+`overlay` (default true). Prints nothing; returns a base64 PNG of the sheet.
+
+Not a mock-up, and that is the whole point. It composes the page with the same code the print path
+uses, on the same driver query — the sheet the printer is really loaded with, the rectangle its
+head can really reach — and hands the result to the same PDFBox renderer, aimed at an image instead
+of a driver. The auto-landscape flip, the clamping, the scale-to-fit and the dead strip along one
+edge all show up for the same reason they happen on paper. A preview drawn any other way would
+agree with the printer right up to the moment it mattered.
+
+The image is the **sheet**, not the page: a landscape job is drawn back through the inverse of the
+orientation transform, so what you see is the label the way it comes off the roll rather than the
+page turned on its side. With `overlay` on it also carries the sheet edge, the resolved printable
+rectangle (dashed), and — the one that is otherwise invisible — the strip the head cannot reach.
+
+```json
+{ "ok": true, "printer": "TSC TE244",
+  "page": { "...": "the block below" },
+  "summary": ["paper        295.1 x 432.0 pt   4.10 x 6.00 in", "..."],
+  "preview": { "mime": "image/png", "encoding": "base64", "widthPx": 615, "heightPx": 900,
+               "dpi": 150, "pageIndex": 0, "pageCount": 1, "data": "iVBORw0K..." } }
+```
+
+Diagnostics queue on the printer's own lane rather than jumping it, because they read the very
+driver state a print in flight is using. On an idle station that is free; behind a running picklist
+it waits, and gives up after 20s with a 503 rather than holding an HTTP thread.
+
+### `POST /preflight` — will this profile fit, before anything prints
+
+`printer` and `options`; `data` optional. Resolves the geometry against the loaded media and
+reports it. Burns nothing.
+
+```
+paper        295.1 x 432.0 pt   4.10 x 6.00 in
+imageable    x=3.5 y=0.0   288.0 x 432.0 pt
+orientation  landscape (auto-detected)
+scaling      scale-to-fit  x0.632
+clamped      x 0.0 -> 3.5 pt (head)
+clamped      height 720.0 -> 432.0 pt (media)
+```
+
+That is a real answer from a real TSC TE244 for the 4x10in Flipkart invoice profile, and it is the
+whole diagnosis: the strip is ten inches on a six-inch roll, and zero margins reach 1.25mm past
+where the head can mark. `fits` is false whenever anything had to be cut down — which does not mean
+the job will fail, it means it will print something other than what the profile describes, and that
+is the failure that is expensive to notice.
+
+Send `data` when the answer must be exact. Orientation is the one part of the composition that can
+depend on the document — an absent `orientation` means the auto-landscape detection, which reads
+the PDF's own page box — so a preflight without one resolves against a placeholder page and says so
+in `documentSupplied` and `caveat`. Everything about size, margins and clamping is answered either
+way.
+
 ### `GET /jobs/{id}` — also accepts `?wait=<ms>`
+
+Carries a `page` block for any document job that got as far as composing one, in the same shape
+`/preflight` returns: `paper`, `imageable`, `effective` (what PDFBox was actually handed, which is
+the paper rectangle transposed on a rotated page), `head`, `orientation` with its `source`
+(`requested`, `auto-detected` or `driver-default`), the scale factor, `fits`, and a `notes` list
+naming every clamp with the bound that caused it — `media` for the sheet, `head` for the printable
+area. Recorded before the print rather than after, so a job that fails at the driver still reports
+the page it was failing to print.
+
+The service always knew all of this. It just never said so, and finding out meant reflecting into a
+private method.
+
 ### `POST /reconnect` — drop and reopen every printer socket
 
 Errors are always `{ "ok": false, "error": "..." }` with a real status code: 400 bad request,
 403 origin not allowed, 404 unknown printer/job, 413 body too large, 502 print failed,
-503 queue full.
+503 queue full or the lane did not answer in time.
 
 ---
 
@@ -335,6 +402,8 @@ src/main/java/com/jagdushah/printly/
   PrintRouter.java        routes a job to the label lane or the document lane
   DocumentLane.java       PDFs rasterized with PDFBox, printed via PrinterJob
   PrintOptions.java       paper geometry off /print, normalised to points
+  ResolvedPage.java       what those options resolved to on the real media, and every clamp
+  PagePreview.java        the same composition and renderer, aimed at a PNG instead of a driver
   Job.java / JobRegistry.java   job state and recent-job lookup
   TrayUi.java             system tray status, reconnect, quit
   Log.java                rotating file + console log

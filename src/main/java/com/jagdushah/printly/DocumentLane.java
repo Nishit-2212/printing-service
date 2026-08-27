@@ -2,7 +2,6 @@ package com.jagdushah.printly;
 
 import java.awt.geom.Rectangle2D;
 import java.awt.print.PageFormat;
-import java.awt.print.Paper;
 import java.awt.print.PrinterException;
 import java.awt.print.PrinterJob;
 import java.io.ByteArrayOutputStream;
@@ -13,7 +12,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -37,7 +40,6 @@ import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.printing.PDFPrintable;
-import org.apache.pdfbox.printing.Scaling;
 import org.apache.pdfbox.rendering.PDFRenderer;
 
 /**
@@ -229,9 +231,237 @@ public final class DocumentLane {
         if (!running) {
             return false;
         }
-        Lane lane = lanes.computeIfAbsent(
-                job.printer().toLowerCase(Locale.ROOT), key -> new Lane(job.printer()));
-        return lane.offer(job);
+        return lane(job.printer()).offer(new PrintTask(job));
+    }
+
+    private Lane lane(String printer) {
+        return lanes.computeIfAbsent(printer.toLowerCase(Locale.ROOT), key -> new Lane(printer));
+    }
+
+    // ------------------------------------------------------------------ diagnostics
+
+    /**
+     * How long a diagnostic call waits for its turn on the lane.
+     *
+     * <p>Diagnostics queue behind prints rather than jumping them, because they read the very
+     * driver state a print in flight is using and a second thread poking at a {@link PrinterJob}
+     * is how this lane earns a heisenbug. That is nearly always free — the calibration screen is
+     * used on an idle station — and this bound is what stops "nearly always" from becoming a
+     * wedged HTTP thread when it is not.
+     */
+    private static final long DIAGNOSTIC_TIMEOUT_MS = 20_000;
+
+    /**
+     * Render what this printer would actually put on the label, without putting it there.
+     *
+     * <p>Runs on the printer's own lane thread, which is the point: the sheet and the printable
+     * area come from the same cached driver query a print would use, so the preview cannot be
+     * right about a printer the print path is wrong about. See {@link PagePreview}.
+     *
+     * @param pdf       the bytes that would have been printed
+     * @param pageIndex 0-based page of that PDF
+     * @param dpi       preview resolution; 0 for {@link PagePreview#DEFAULT_DPI}
+     * @param overlay   draw the sheet, imageable and head-unreachable guides
+     * @return {@code page} — the full {@link ResolvedPage} report — plus {@code preview}, a
+     *         base64 PNG
+     */
+    public Map<String, Object> preview(String printer, byte[] pdf, PrintOptions options,
+            int pageIndex, double dpi, boolean overlay) {
+        return call(printer, lane -> {
+            try (PDDocument doc = loadPdf(pdf)) {
+                ResolvedPage page = lane.resolve(options, doc);
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("printer", lane.printer);
+                out.put("page", page.toJson());
+                out.put("summary", page.toText());
+                out.put("preview", PagePreview.render(page, doc, options, pageIndex, dpi, overlay));
+                return out;
+            }
+        });
+    }
+
+    /**
+     * Answer whether a profile fits this printer's loaded media, before anything prints.
+     *
+     * <p>The service already knows: it knows the media is 4.098x6.000in and that the head reaches
+     * 0.049 to 4.049, and it has always known which of the caller's numbers it had to cut down to
+     * get there. It just never said so until the label came out wrong. This resolves the geometry
+     * and reports it, and burns nothing.
+     *
+     * <p>{@code pdf} is optional but not decorative. Orientation is the one part of the
+     * composition that can depend on the document — an absent {@code orientation} means QZ's
+     * auto-landscape detection, which reads the PDF's own page box — so a preflight without one
+     * resolves against a placeholder page and says so in {@code documentSupplied}. Every question
+     * about size, margins and clamping is answered either way.
+     */
+    public Map<String, Object> preflight(String printer, byte[] pdf, PrintOptions options) {
+        return call(printer, lane -> {
+            boolean supplied = pdf != null && pdf.length > 0;
+            try (PDDocument doc = supplied ? loadPdf(pdf) : placeholder(options)) {
+                ResolvedPage page = lane.resolve(options, doc);
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("printer", lane.printer);
+                out.put("fits", page.fits());
+                out.put("documentSupplied", supplied);
+                if (!supplied && options.orientation() == null) {
+                    // Said plainly rather than left to be inferred from a boolean: this is the one
+                    // field of the answer that is a guess, and a caller that reads it as settled
+                    // would be as wrong as the bug this endpoint exists to catch.
+                    out.put("caveat", "no PDF was supplied and no orientation was requested, so the "
+                            + "auto-landscape detection ran against a placeholder page — send the "
+                            + "PDF for the orientation this printer would really use");
+                }
+                out.put("page", page.toJson());
+                out.put("summary", page.toText());
+                return out;
+            }
+        });
+    }
+
+    /**
+     * Parse a PDF a diagnostic endpoint was handed, as a caller error rather than a lane failure.
+     *
+     * <p>{@code PDDocument.load} throws {@link java.io.IOException} on a truncated or non-PDF
+     * payload, and a checked exception coming off the lane thread reads to {@link #call} as "the
+     * printer could not be reached" — so the caller got a 503 telling them to retry, for a
+     * document no amount of retrying will fix. This is the translation that keeps the 400 and the
+     * 503 meaning what they say.
+     */
+    private static PDDocument loadPdf(byte[] pdf) {
+        PDDocument doc;
+        try {
+            doc = PDDocument.load(pdf);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("\"data\" is not a readable PDF: "
+                    + (e.getMessage() == null ? e.toString() : e.getMessage()));
+        }
+        if (doc.getNumberOfPages() == 0) {
+            try {
+                doc.close();
+            } catch (Exception ignored) {
+                // Nothing useful to do with a failure to close a document already being rejected.
+            }
+            throw new IllegalArgumentException("the PDF has no pages");
+        }
+        return doc;
+    }
+
+    /** A blank page the size the caller asked for, so a document-less preflight has a subject. */
+    private static PDDocument placeholder(PrintOptions o) {
+        PDDocument doc = new PDDocument();
+        float w = (float) (o.hasSize() ? o.widthPt() : 288);
+        float h = (float) (o.hasSize() ? o.heightPt() : 432);
+        doc.addPage(new PDPage(new PDRectangle(w, h)));
+        return doc;
+    }
+
+    /**
+     * Run something on a printer's lane thread and wait for it.
+     *
+     * <p>Unwraps the worker's exception onto the calling thread so the HTTP layer sees the real
+     * cause — a malformed PDF has to surface as a 400 naming the PDF, not as a 500 naming a
+     * {@code CompletableFuture}.
+     */
+    private Map<String, Object> call(String printer, LaneCall work) {
+        if (!running) {
+            throw new IllegalStateException("the document lane is shutting down");
+        }
+        Lane lane = lane(printer);
+        CallTask task = new CallTask(work);
+        if (!lane.offer(task)) {
+            throw new IllegalStateException("the queue for '" + printer
+                    + "' is full — printer is not keeping up");
+        }
+        try {
+            return task.result.get(DIAGNOSTIC_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted waiting for '" + printer + "'");
+        } catch (TimeoutException e) {
+            throw new IllegalStateException("'" + printer + "' did not answer within "
+                    + DIAGNOSTIC_TIMEOUT_MS + "ms — it may be busy printing");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() == null ? e : e.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IllegalStateException(cause.getMessage() == null
+                    ? String.valueOf(cause) : cause.getMessage());
+        }
+    }
+
+    /** What {@link #call} runs, confined to one lane's worker thread. */
+    private interface LaneCall {
+        Map<String, Object> run(Lane lane) throws Exception;
+    }
+
+    /**
+     * One unit of work on a lane's thread.
+     *
+     * <p>The queue used to hold {@link Job} directly. It holds this instead so a preview can share
+     * the thread, the cached {@link PrinterJob} and the cached driver page with the prints it is
+     * previewing — the alternative, querying the driver from the HTTP thread, would let the
+     * preview answer for a different page than the one the next print composes.
+     */
+    private interface LaneTask {
+        void run(Lane lane) throws Exception;
+
+        /** Settle the task after {@link #run} threw. Never itself throws. */
+        void fail(Exception e, Lane lane);
+    }
+
+    /** A real print. Failure poisons the lane's print context, because it may have poisoned it. */
+    private final class PrintTask implements LaneTask {
+
+        private final Job job;
+
+        PrintTask(Job job) {
+            this.job = job;
+        }
+
+        @Override
+        public void run(Lane lane) throws Exception {
+            job.markPrinting();
+            lane.print(job);
+            job.complete();
+            Log.info("document job " + job.id() + " done: printer='" + job.printer() + "' "
+                    + lane.kb(job) + " " + job.timingLine());
+        }
+
+        @Override
+        public void fail(Exception e, Lane lane) {
+            // A job that threw part-way through may have left the native print context in a state
+            // the next job would inherit. Cheaper to rebuild than to reason about.
+            lane.discardContext();
+            String reason = e.getMessage() == null ? e.toString() : e.getMessage();
+            Log.warn("document job " + job.id() + " failed on '" + lane.printer + "': " + reason);
+            job.fail(reason);
+        }
+    }
+
+    /**
+     * A diagnostic call. Failure completes the caller's future and leaves the lane alone —
+     * a malformed PDF handed to {@code /preview} is the caller's problem, not the printer's, and
+     * dropping the print context over it would make the next real label pay 35ms for nothing.
+     */
+    private final class CallTask implements LaneTask {
+
+        private final LaneCall work;
+        private final CompletableFuture<Map<String, Object>> result = new CompletableFuture<>();
+
+        CallTask(LaneCall work) {
+            this.work = work;
+        }
+
+        @Override
+        public void run(Lane lane) throws Exception {
+            result.complete(work.run(lane));
+        }
+
+        @Override
+        public void fail(Exception e, Lane ignored) {
+            result.completeExceptionally(e);
+        }
     }
 
     /**
@@ -259,7 +489,7 @@ public final class DocumentLane {
     private final class Lane {
 
         private final String printer;
-        private final BlockingQueue<Job> queue;
+        private final BlockingQueue<LaneTask> queue;
         private final Thread worker;
 
         /** Set from any thread by {@link #invalidate()}; cleared only by the worker. */
@@ -272,6 +502,9 @@ public final class DocumentLane {
         private Rectangle2D printableArea;
         private boolean printableAreaResolved;
 
+        /** The last clamp reported for this printer, so an identical one stays quiet. */
+        private String lastClamp;
+
         Lane(String printer) {
             this.printer = printer;
             this.queue = new ArrayBlockingQueue<>(queueCapacity);
@@ -282,8 +515,8 @@ public final class DocumentLane {
                     + laneCount.incrementAndGet() + " active)");
         }
 
-        boolean offer(Job job) {
-            return queue.offer(job);
+        boolean offer(LaneTask task) {
+            return queue.offer(task);
         }
 
         void invalidate() {
@@ -294,31 +527,42 @@ public final class DocumentLane {
             worker.interrupt();
         }
 
+        /** Drop the cached print context so the next task rebuilds it. Worker thread only. */
+        void discardContext() {
+            context = null;
+            boundTo = null;
+        }
+
         private void run() {
             while (running) {
-                Job job;
+                LaneTask task;
                 try {
-                    job = queue.take();
+                    task = queue.take();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return;
                 }
-                job.markPrinting();
                 try {
-                    print(job);
-                    job.complete();
-                    Log.info("document job " + job.id() + " done: printer='" + printer + "' "
-                            + kb(job) + " " + job.timingLine());
+                    task.run(this);
                 } catch (Exception e) {
-                    // A job that threw part-way through may have left the native print context in
-                    // a state the next job would inherit. Cheaper to rebuild than to reason about.
-                    context = null;
-                    boundTo = null;
-                    String reason = e.getMessage() == null ? e.toString() : e.getMessage();
-                    Log.warn("document job " + job.id() + " failed on '" + printer + "': " + reason);
-                    job.fail(reason);
+                    // How a failure is settled is the task's business — a print poisons the
+                    // context, a preview does not — so the loop only routes it.
+                    task.fail(e, this);
                 }
             }
+        }
+
+        /**
+         * Compose the page for a document, against this printer's real media.
+         *
+         * <p>The single place the geometry is worked out, shared by printing, previewing and
+         * preflighting. A preview that resolved its own page would be a second implementation to
+         * keep in step, and the first thing to drift would be the clamping that this whole exercise
+         * exists to make visible.
+         */
+        private ResolvedPage resolve(PrintOptions options, PDDocument doc)
+                throws PrintException, PrinterException {
+            return ResolvedPage.resolve(driverPage(), printableArea(), options, doc);
         }
 
         private void print(Job job) throws Exception {
@@ -334,14 +578,21 @@ public final class DocumentLane {
                 PrintOptions options = job.options();
                 PrinterJob pj = context();
                 pj.setJobName("printly " + job.id());
+                ResolvedPage page = resolve(options, doc);
+                // Recorded before the print rather than after, so a job that fails at the driver
+                // still reports the page it was failing to print. That is the case where knowing
+                // the geometry matters most, and the case an after-the-fact record would miss.
+                job.resolvedPage(page);
+                noteClamping(job, page);
                 // center=false pins the content to the top-left of the imageable area, which is
                 // what QZ did: its PDFWrapper passes center=false explicitly. PDFBox's
                 // four-argument constructor defaults it to true, and centring shifts the artwork
                 // on any profile whose margins are asymmetric — the Flipkart label's left 0.3in
                 // against right 0 is exactly that, and the shift lands on the barcode.
                 pj.setPrintable(
-                        new PDFPrintable(doc, scaling(options), false, (float) options.density(), false),
-                        pageFormat(driverPage(), printableArea(), options, doc));
+                        new PDFPrintable(doc, ResolvedPage.scaling(options),
+                                false, (float) options.density(), false),
+                        page.pageFormat());
                 long setupMs = System.currentTimeMillis() - t1;
 
                 long t2 = System.currentTimeMillis();
@@ -442,266 +693,36 @@ public final class DocumentLane {
             return (PageFormat) driverPage.clone();
         }
 
+        /**
+         * Say once, per printer, when a profile does not fit the media it is going onto.
+         *
+         * <p>Not a refusal. The label still prints, and a mid-shift job is not the place to start
+         * rejecting geometry that has been printing all week — that judgement belongs to
+         * {@code /preflight}, before the picklist starts.
+         *
+         * <p>Once, because a clamp is a property of the profile and the loaded roll, not of the
+         * job: the Flipkart invoice is a 4x10in strip on a 4x6 label by design, so warning per
+         * print would be fifty identical lines a picklist and would bury the one that changed.
+         * Repeated when the message changes, which is what a re-loaded roll or an edited margin
+         * looks like from here.
+         */
+        private void noteClamping(Job job, ResolvedPage page) {
+            if (page.fits()) {
+                lastClamp = null;
+                return;
+            }
+            String summary = String.join("; ", page.toText());
+            if (summary.equals(lastClamp)) {
+                return;
+            }
+            lastClamp = summary;
+            Log.warn("document job " + job.id() + " geometry was clamped on '" + printer
+                    + "' (further identical clamps on this printer are not repeated): " + summary);
+        }
+
         private String kb(Job job) {
             return String.format(Locale.ROOT, "%.1fKB", job.payload().length / 1024.0);
         }
-    }
-
-    /**
-     * Build the page geometry: the caller's rectangle, on the media the printer actually holds.
-     *
-     * <h2>The paper is the driver's, never the caller's</h2>
-     *
-     * <p>{@code size} sets the <em>printable rectangle</em>, not the sheet. An earlier version
-     * read it as the sheet and called {@link Paper#setSize}, which is the one place this lane
-     * diverged from QZ Tray badly enough to be visible on paper: the Flipkart invoice profile is
-     * 4x10in, so a pack station with both printers pointed at its 4x6 label roll was asking the
-     * TSC to feed ten inches, and one order came out over three labels instead of two.
-     *
-     * <p>QZ never overrode the sheet on the PDF path. It put the geometry into a
-     * {@code MediaPrintableArea} and let {@link PrinterJob#getPageFormat} resolve it, which keeps
-     * the driver's own stock as the paper — measured on a TSC TE244 configured for 4.10x6.00in:
-     *
-     * <pre>
-     * getPageFormat(MediaPrintableArea 4x10in)  -> paper 4.10x6.00in, imageable 2.10x4.00in
-     * getPageFormat(MediaPrintableArea 4x6in inset 0.3/0.1)
-     *                                           -> paper 4.10x6.00in, imageable 3.70x5.80in
-     * </pre>
-     *
-     * <p>The second line is the label profile, and it is exactly what this method computes, which
-     * is why labels never diverged and only the invoices did.
-     *
-     * <h2>Oversized rectangles are clamped, not dropped</h2>
-     *
-     * <p>The first line above is the JDK dropping a rectangle that does not fit the media and
-     * falling back to its own one-inch inset — it does that for anything without slack, an exact
-     * 4x6 on 4.10x6.00 included. So QZ printed the invoice into a 2.10x4.00in box adrift in the
-     * middle of the label. That is not worth reproducing: this lane clamps instead, so a 4x10in
-     * invoice fills the 4x6 label rather than shrinking into the centre of it. Page count matches
-     * QZ, legibility beats it.
-     *
-     * <h2>Clamped to what the head can actually mark</h2>
-     *
-     * <p>Not to the sheet — to the printable area the driver advertises for the loaded media,
-     * which is usually smaller. The TSC TE244 reports {@code x=0.049in, y=0, 4.000x6.000in} on a
-     * 4.098in-wide roll: a 1.25mm strip down the left edge its head cannot reach. Zero margins
-     * clamped to the sheet put content into that strip, and because the invoice profiles print
-     * landscape, the sheet's left edge is the top of the rotated page — so the invoice came out
-     * with its top millimetre shaved off.
-     *
-     * <p>"Full bleed" therefore means as much of the sheet as the hardware can mark, which is the
-     * only reading a printer can honour. A driver that advertises nothing falls back to the sheet.
-     *
-     * <p>{@link PrinterJob#validatePage} is still never called. Clamping to the advertised
-     * printable area is exactly as much driver-conformance as is wanted; validatePage goes further
-     * and snaps the whole page onto an advertised stock, which turns a 4x6 label into Letter on
-     * any driver whose list does not happen to include it.
-     *
-     * @param driverPage the printer's own page, from {@link Lane#driverPage()}; its paper is the
-     *                   loaded media and is what decides how far the printer feeds
-     * @param printable  what the head can mark, in points on the sheet, or null if unadvertised
-     * @param doc        needed because orientation can depend on it, see {@link #applyOrientation}
-     */
-    private static PageFormat pageFormat(PageFormat driverPage, Rectangle2D printable,
-            PrintOptions o, PDDocument doc) {
-        if (!o.hasSize() && !o.hasMargins()) {
-            applyOrientation(driverPage, o, doc, false);
-            return driverPage;
-        }
-
-        Paper paper = driverPage.getPaper();
-        double pageWidth = paper.getWidth();
-        double pageHeight = paper.getHeight();
-
-        double left = o.hasMargins() ? o.marginLeftPt() : 0;
-        double top = o.hasMargins() ? o.marginTopPt() : 0;
-        double right = o.hasMargins() ? o.marginRightPt() : 0;
-        double bottom = o.hasMargins() ? o.marginBottomPt() : 0;
-
-        // Absent size means "the whole sheet", which is the only reading left once the sheet is
-        // the driver's: margins alone then inset the media, as they always did.
-        double width = (o.hasSize() ? o.widthPt() : pageWidth) - left - right;
-        double height = (o.hasSize() ? o.heightPt() : pageHeight) - top - bottom;
-
-        // PrintOptions already checks margins against an explicit size. This catches the other
-        // case: margins sent without a size, measured against whatever paper the driver reports.
-        if (width <= 0 || height <= 0) {
-            throw new IllegalArgumentException("margins leave no printable area on the "
-                    + Math.round(pageWidth) + "x" + Math.round(pageHeight)
-                    + "pt page this printer reports");
-        }
-
-        // Java gives every Paper a one-inch imageable margin on all four sides by default. Left
-        // alone that crushes a 4x6 label into the middle of the media and puts the barcode
-        // somewhere the courier's scanner will not find it, so the printable area is always set
-        // explicitly — zero margins meaning as much of the sheet as the head can mark.
-        Paper sized = driverPage.getPaper();
-        sized.setImageableArea(left, top, width, height);
-        driverPage.setPaper(sized);
-        clampImageable(driverPage, printable);
-
-        applyOrientation(driverPage, o, doc, true);
-        // Again after orientation: swapImageableArea transposes the rectangle, which can push a
-        // landscape profile back off a sheet narrower than that profile is tall.
-        clampImageable(driverPage, printable);
-        return driverPage;
-    }
-
-    /**
-     * Pull the printable rectangle back inside what the printer can mark.
-     *
-     * <p>Two jobs. Bounding it by the sheet is what makes a 4x10in invoice profile land on a 4x6
-     * label instead of asking for ten inches of stock — hand a thermal printer a page taller than
-     * its media and it simply keeps feeding. Bounding it by the advertised printable area is what
-     * stops content being placed in a margin the head cannot reach, which is otherwise silently
-     * shaved off the edge.
-     *
-     * @param printable the head's reach in points on the sheet, or null when unadvertised
-     */
-    private static void clampImageable(PageFormat pf, Rectangle2D printable) {
-        Paper paper = pf.getPaper();
-        double minX = 0;
-        double minY = 0;
-        double maxX = paper.getWidth();
-        double maxY = paper.getHeight();
-        if (printable != null) {
-            // Intersect rather than replace: a driver that over-reports must not be able to grow
-            // the area beyond the sheet the feed is measured against.
-            minX = Math.max(minX, printable.getMinX());
-            minY = Math.max(minY, printable.getMinY());
-            maxX = Math.min(maxX, printable.getMaxX());
-            maxY = Math.min(maxY, printable.getMaxY());
-        }
-        double x = clamp(paper.getImageableX(), minX, maxX);
-        double y = clamp(paper.getImageableY(), minY, maxY);
-        paper.setImageableArea(x, y,
-                Math.min(paper.getImageableWidth(), maxX - x),
-                Math.min(paper.getImageableHeight(), maxY - y));
-        pf.setPaper(paper);
-    }
-
-    private static double clamp(double value, double min, double max) {
-        return Math.max(min, Math.min(max, value));
-    }
-
-    /**
-     * Set the page orientation the way QZ Tray did.
-     *
-     * <p>An explicit {@code orientation} always wins. When the caller sends none, QZ did
-     * <em>not</em> fall through to the driver — it inspected the PDF and flipped the page to
-     * landscape itself, in {@code PrintPDF.print}. An earlier version of this method read the
-     * absent value as "leave it to the driver" and stated so in a comment, which is what silently
-     * turned the Flipkart invoice upright: its page is 595x455.7pt, landscape, and QZ had been
-     * rotating it onto the 4x10in strip all along.
-     *
-     * @param sized whether the caller's geometry was applied to the paper, which is the only case
-     *              where the landscape swap below has a rectangle worth swapping
-     */
-    private static void applyOrientation(PageFormat pf, PrintOptions o, PDDocument doc, boolean sized) {
-        if (o.orientation() == null) {
-            autoLandscape(pf, doc);
-            return;
-        }
-        pf.setOrientation(switch (o.orientation()) {
-            case PORTRAIT -> PageFormat.PORTRAIT;
-            case LANDSCAPE -> PageFormat.LANDSCAPE;
-            case REVERSE_LANDSCAPE -> PageFormat.REVERSE_LANDSCAPE;
-        });
-        if (sized && o.orientation() != PrintOptions.Orientation.PORTRAIT) {
-            swapImageableArea(pf);
-        }
-    }
-
-    /**
-     * QZ's auto-landscape detection, ported as-is:
-     *
-     * <pre>{@code
-     * if ((page.getImageableHeight() > page.getImageableWidth()
-     *         && bounds.getWidth() > bounds.getHeight())
-     *         ^ (pd.getRotation() / 90) % 2 == 1) {
-     *     page.setOrientation(LANDSCAPE);
-     * }
-     * }</pre>
-     *
-     * <p>The exclusive-or is what makes it read right: a landscape page on portrait paper needs
-     * the flip, and so does a portrait page carrying {@code /Rotate 90}, but a landscape page that
-     * is <em>also</em> quarter-turned is already upright and must be left alone. PDFBox normalises
-     * {@code /Rotate} into [0,360), so the division cannot go negative here.
-     *
-     * <p>{@link PDPage#getBBox()} rather than the media box, again because that is what QZ read.
-     *
-     * <p>QZ evaluated this per page against one shared {@code PageFormat} and only ever latched
-     * landscape on, never off. This lane binds a single format to the whole document through
-     * {@link PrinterJob#setPrintable}, so it cannot vary per page at all; scanning until the first
-     * page that asks for the flip is the same answer for every document the packing flow prints,
-     * all of which are single-page by the time they arrive.
-     */
-    private static void autoLandscape(PageFormat pf, PDDocument doc) {
-        boolean portraitPaper = pf.getImageableHeight() > pf.getImageableWidth();
-        for (PDPage page : doc.getPages()) {
-            PDRectangle bounds = page.getBBox();
-            boolean landscapeSource = bounds.getWidth() > bounds.getHeight();
-            boolean quarterTurned = (page.getRotation() / 90) % 2 == 1;
-            if ((portraitPaper && landscapeSource) ^ quarterTurned) {
-                pf.setOrientation(PageFormat.LANDSCAPE);
-                return;
-            }
-        }
-    }
-
-    /**
-     * Transpose the imageable rectangle, which QZ did for every non-portrait orientation on top of
-     * {@code setOrientation}.
-     *
-     * <p>Java already reports a landscape page's imageable width and height swapped, so doing it
-     * again on the paper looks redundant and is arguably a QZ bug — but the Meesho label
-     * (6x5.7in) and the merged Flipkart/Meesho invoice (8.5x7.5in) were both calibrated on real
-     * output with the swap in place, and undoing it silently transposes their printable area.
-     *
-     * <p>Not replicated: QZ applied this once per page of the document, so an even page count
-     * swapped it back to where it started. Every profile that reaches here is single-page, which
-     * is why nobody noticed; doing it once is the behaviour those labels were actually tuned
-     * against.
-     */
-    private static void swapImageableArea(PageFormat pf) {
-        Paper paper = pf.getPaper();
-        paper.setImageableArea(paper.getImageableX(), paper.getImageableY(),
-                paper.getImageableHeight(), paper.getImageableWidth());
-        pf.setPaper(paper);
-    }
-
-    /**
-     * Map the caller's scale onto PDFBox's.
-     *
-     * <p>QZ Tray had no {@code scale} option at all. It had a boolean {@code scaleContent},
-     * defaulting to true, and consumed it in one line:
-     *
-     * <pre>{@code
-     * Scaling scale = (pxlOpts.isScaleContent()? Scaling.SCALE_TO_FIT:Scaling.ACTUAL_SIZE);
-     * }</pre>
-     *
-     * <p>So every {@code scale}, {@code fit-to-page} and {@code fitToPage} key the packing flow
-     * ever sent QZ was discarded, and every PDF it printed was scaled to fill the page. The
-     * calibrated sizes upstream were tuned against that, which is why the three names below
-     * collapse onto two behaviours: anything that is not {@code actual} fills the page.
-     *
-     * <p>This costs the one thing QZ could not express either — a genuine shrink-only fit, which
-     * would leave an undersized label at its own size instead of enlarging it. Reading {@code fit}
-     * that way is what printed the Flipkart label small: its page is 215x360.3pt inside a
-     * 266.4x417.6pt imageable area, so shrink-to-fit had nothing to shrink and QZ's ~1.16x
-     * enlargement disappeared. Adding a fourth name for shrink-only is the way back, once
-     * something actually wants it.
-     */
-    private static Scaling scaling(PrintOptions o) {
-        if (o.scale() == null) {
-            // QZ's default, not PDFBox's: scaleContent defaulted to true, so an options object
-            // that says nothing about scale still filled the page.
-            return Scaling.SCALE_TO_FIT;
-        }
-        return switch (o.scale()) {
-            case ACTUAL -> Scaling.ACTUAL_SIZE;
-            case FIT, FIT_TO_PAGE -> Scaling.SCALE_TO_FIT;
-        };
     }
 
     private static PrintRequestAttributeSet attributes(Job job, PrintOptions o, int pages) {

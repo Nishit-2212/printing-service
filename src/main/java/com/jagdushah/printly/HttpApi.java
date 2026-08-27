@@ -65,6 +65,8 @@ public final class HttpApi {
         server.createContext("/health", wrap(this::handleHealth));
         server.createContext("/printers", wrap(this::handlePrinters));
         server.createContext("/print", wrap(this::handlePrint));
+        server.createContext("/preview", wrap(this::handlePreview));
+        server.createContext("/preflight", wrap(this::handlePreflight));
         server.createContext("/jobs", wrap(this::handleJobs));
         server.createContext("/reconnect", wrap(this::handleReconnect));
         server.createContext("/", wrap(this::handleNotFound));
@@ -242,8 +244,112 @@ public final class HttpApi {
         respond(exchange, status, body);
     }
 
+    /**
+     * Render a document exactly as this printer would print it, and return it as a PNG.
+     *
+     * <p>The same page composition and the same PDFBox renderer the print path uses, aimed at an
+     * image instead of a driver. That is the whole value: a mock-up would agree with the printer
+     * right up to the moment it mattered, whereas this cannot disagree without PDFBox or the
+     * driver itself having changed underneath both.
+     *
+     * <p>Body is {@code /print}'s, minus {@code copies}: {@code printer}, {@code data} (base64
+     * PDF), {@code options}. Plus {@code page} (1-based, default 1), {@code dpi} and
+     * {@code overlay} (default true — the sheet edge, the resolved rectangle and the strip the
+     * head cannot reach).
+     */
+    private void handlePreview(HttpExchange exchange) throws IOException {
+        requirePost(exchange);
+        Map<String, Object> req = body(exchange);
+        String printer = requirePrinter(req);
+        byte[] pdf = requirePdf(req, printer);
+        PrintOptions options = options(req);
+
+        int page = (int) Json.num(req, "page", 1);
+        if (page < 1) {
+            throw new BadRequestException(400, "\"page\" is 1-based");
+        }
+        double dpi = Json.dbl(req, "dpi", 0);
+        boolean overlay = Json.bool(req, "overlay", true);
+        try {
+            respond(exchange, 200, ok(router.preview(printer, pdf, options, page - 1, dpi, overlay)));
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException(400, e.getMessage());
+        } catch (IllegalStateException e) {
+            // The lane could not be reached — busy, shutting down, queue full. Not the caller's
+            // mistake, and a retry is the right response, so it is a 503 rather than a 400.
+            throw new BadRequestException(503, e.getMessage());
+        }
+    }
+
+    /**
+     * Answer whether a profile fits this printer's loaded media, before anything prints.
+     *
+     * <p>This is the guardrail under the calibration screen. The margins in those profiles are
+     * numbers where a wrong value prints a barcode the courier's scanner rejects, so exposing them
+     * to be dragged is only safe alongside something that can say "4x10in will be clamped to 4x6
+     * on this printer" without burning a label to find out.
+     *
+     * <p>{@code data} is optional here — see {@code DocumentLane.preflight} for what that costs.
+     */
+    private void handlePreflight(HttpExchange exchange) throws IOException {
+        requirePost(exchange);
+        Map<String, Object> req = body(exchange);
+        String printer = requirePrinter(req);
+        PrintOptions options = options(req);
+        byte[] pdf = req.get("data") == null ? null : requirePdf(req, printer);
+        try {
+            respond(exchange, 200, ok(router.preflight(printer, pdf, options)));
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException(400, e.getMessage());
+        } catch (IllegalStateException e) {
+            throw new BadRequestException(503, e.getMessage());
+        }
+    }
+
+    private Map<String, Object> body(HttpExchange exchange) throws IOException {
+        byte[] raw = readBody(exchange, config.maxBodyBytes);
+        return Json.parseObject(new String(raw, StandardCharsets.UTF_8));
+    }
+
+    private static String requirePrinter(Map<String, Object> req) {
+        String printer = Json.str(req, "printer", "").trim();
+        if (printer.isEmpty()) {
+            throw new BadRequestException(400, "\"printer\" is required");
+        }
+        return printer;
+    }
+
+    private byte[] requirePdf(Map<String, Object> req, String printer) {
+        Object data = req.get("data");
+        if (!(data instanceof String text)) {
+            throw new BadRequestException(400, "\"data\" must be a base64 string");
+        }
+        byte[] payload = decode(printer, "pdf", text, Json.str(req, "encoding", null));
+        if (payload.length == 0) {
+            throw new BadRequestException(400, "\"data\" decoded to zero bytes");
+        }
+        return payload;
+    }
+
+    /** Same parse and the same refusal as {@code /print}, so a profile cannot preview differently. */
+    private static PrintOptions options(Map<String, Object> req) {
+        try {
+            return PrintOptions.from(req.get("options"));
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException(400, "\"options\": " + e.getMessage());
+        }
+    }
+
+    private static Map<String, Object> ok(Map<String, Object> body) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("ok", true);
+        m.putAll(body);
+        return m;
+    }
+
     private void handleNotFound(HttpExchange exchange) throws IOException {
-        respond(exchange, 404, error("no such endpoint — try /health, /printers, /print, /jobs/{id}"));
+        respond(exchange, 404, error("no such endpoint — try /health, /printers, /print, "
+                + "/preview, /preflight, /jobs/{id}"));
     }
 
     // ------------------------------------------------------------------ payload decoding

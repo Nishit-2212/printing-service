@@ -35,6 +35,7 @@ public final class Job {
     private volatile long renderMs = -1;
     private volatile long setupMs = -1;
     private volatile long spoolMs = -1;
+    private volatile ResolvedPage page;
 
     public Job(String printer, String type, byte[] payload, int copies, PrintOptions options) {
         this.id = "j_" + Long.toString(SEQ.incrementAndGet(), 36);
@@ -73,6 +74,22 @@ public final class Job {
      */
     public PrintOptions options() {
         return options;
+    }
+
+    /**
+     * The page the document lane actually composed for this job, once it has composed one.
+     *
+     * <p>Null for a label job, and for a document job that failed before the geometry was worked
+     * out. Anything else and this is the answer to "what did the service think it was printing" —
+     * a question that previously needed reflection into a private method to answer, and by then
+     * the job was long gone.
+     */
+    public ResolvedPage resolvedPage() {
+        return page;
+    }
+
+    void resolvedPage(ResolvedPage page) {
+        this.page = page;
     }
 
     public State state() {
@@ -208,6 +225,13 @@ public final class Job {
         }
         if (!options.isEmpty()) {
             m.put("options", options.toJson());
+        }
+        // What the options resolved to on the printer's real media, which is a different question
+        // from what was asked for and the only one the output answers. Present on document jobs
+        // that got as far as composing a page.
+        ResolvedPage resolved = page;
+        if (resolved != null) {
+            m.put("page", resolved.toJson());
         }
         return m;
     }
