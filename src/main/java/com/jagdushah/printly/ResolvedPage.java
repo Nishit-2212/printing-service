@@ -212,6 +212,8 @@ public final class ResolvedPage {
         // the margins inset it, the clamp bounds by it, and the preview draws it.
         if (o.sizeIsSheet() && o.hasSize()) {
             Paper sheet = driverPage.getPaper();
+            double loadedWidth = sheet.getWidth();
+            double loadedHeight = sheet.getHeight();
             sheet.setSize(o.widthPt(), o.heightPt());
             driverPage.setPaper(sheet);
             notes.add(Note.info("size-is-sheet", String.format(Locale.ROOT,
@@ -219,6 +221,24 @@ public final class ResolvedPage {
                             + "media ignored, as QZ Tray did. The printer will feed this length "
                             + "whether or not it is loaded.",
                     o.widthPt() / PT_PER_IN, o.heightPt() / PT_PER_IN)));
+
+            // The one thing this whole class cannot answer, said out loud rather than left for a
+            // preview to imply. Everything below composes a page on the declared sheet; the
+            // printer then has to reconcile that page with the media actually loaded, and it does
+            // that inside the driver — it may scale, it may clip, it may ignore the request
+            // entirely. Nothing here observes which. A preview drawn from this page is therefore a
+            // faithful picture of what was *sent* and only a guess at what comes *out*, and the
+            // gap is exactly as wide as the difference below.
+            if (Math.abs(loadedWidth - o.widthPt()) > 1 || Math.abs(loadedHeight - o.heightPt()) > 1) {
+                notes.add(new Note("warn", "sheet-not-loaded", null, null, null, null,
+                        String.format(Locale.ROOT,
+                                "the declared sheet is %.2fx%.2f in but this printer is loaded with "
+                                        + "%.2fx%.2f in — how the driver fits one onto the other is "
+                                        + "not modelled here, so the preview shows the page as sent, "
+                                        + "not as it will land on the label",
+                                o.widthPt() / PT_PER_IN, o.heightPt() / PT_PER_IN,
+                                loadedWidth / PT_PER_IN, loadedHeight / PT_PER_IN)));
+            }
             // The head's reach was measured against the media this just replaced, so it no longer
             // describes anything. QZ did not clamp to it either; dropping it is what keeps the two
             // engines producing the same page rather than nearly the same one.
@@ -256,6 +276,21 @@ public final class ResolvedPage {
         driverPage.setPaper(sized);
 
         orientationSource = applyOrientation(driverPage, o, doc, true, notes);
+
+        // What the trailing margins must keep clear of the media, not just of the caller's own
+        // size. Subtracting them from `size` above is enough while the rectangle fits; the moment
+        // it does not, the clamp below refills to the media edge and swallows them — which is how
+        // a 4x10in invoice with a bottom margin ended up flush against the sheet again.
+        //
+        // Transposed when the rectangle was, because after swapImageableArea the caller's "bottom"
+        // is the rectangle's right-hand side. Nothing swaps on the portrait and auto-landscape
+        // paths, which is why the invoices read straight through.
+        boolean swapped = o.orientation() != null
+                && o.orientation() != PrintOptions.Orientation.PORTRAIT;
+        double reserveRight = !o.hasMargins() ? 0
+                : swapped ? o.marginBottomPt() : o.marginRightPt();
+        double reserveBottom = !o.hasMargins() ? 0
+                : swapped ? o.marginRightPt() : o.marginBottomPt();
         // Clamped once, and only after the orientation swap. It used to be clamped here and again
         // before the swap, which quietly capped every rotated profile to a square.
         //
@@ -273,7 +308,7 @@ public final class ResolvedPage {
         // bounds it by the sheet and the head. It is not a QZ behaviour either way: QZ handed the
         // geometry to getPageFormat and let the JDK drop it, which is the fallback this lane
         // exists to avoid.
-        clampImageable(driverPage, printable, notes);
+        clampImageable(driverPage, printable, reserveRight, reserveBottom, notes);
         return finish(driverPage, printable, orientationSource, o, doc, notes);
     }
 
@@ -297,13 +332,23 @@ public final class ResolvedPage {
      * @param printable the head's reach in points on the sheet, or null when unadvertised
      */
     private static void clampImageable(PageFormat pf, Rectangle2D printable, List<Note> notes) {
+        clampImageable(pf, printable, 0, 0, notes);
+    }
+
+    /**
+     * @param reserveRight  points to keep clear of the right-hand bound, so a trailing margin
+     *                      survives a clamp instead of being refilled to the media edge
+     * @param reserveBottom the same for the bottom bound
+     */
+    private static void clampImageable(PageFormat pf, Rectangle2D printable,
+            double reserveRight, double reserveBottom, List<Note> notes) {
         Paper paper = pf.getPaper();
         double sheetW = paper.getWidth();
         double sheetH = paper.getHeight();
         double minX = 0;
         double minY = 0;
-        double maxX = sheetW;
-        double maxY = sheetH;
+        double maxX = sheetW - Math.max(0, reserveRight);
+        double maxY = sheetH - Math.max(0, reserveBottom);
         if (printable != null) {
             // Intersect rather than replace: a driver that over-reports must not be able to grow
             // the area beyond the sheet the feed is measured against.
@@ -324,13 +369,26 @@ public final class ResolvedPage {
         paper.setImageableArea(x, y, w, h);
         pf.setPaper(paper);
 
-        // Attribute each edge to whichever bound actually bit, because the two have different
-        // fixes: "media" means the profile asks for more stock than is loaded, "head" means it
-        // asks the printer to mark somewhere it physically cannot reach.
+        // Attribute each edge to whichever bound actually bit, because they have different fixes:
+        // "media" means the profile asks for more stock than is loaded, "head" means it asks the
+        // printer to mark where it physically cannot, and "margin" means the caller's own trailing
+        // margin is what stopped it — which is the one case that is working as asked rather than
+        // going wrong, and reads very differently in a report.
+        double headMaxX = printable == null ? sheetW : Math.min(sheetW, printable.getMaxX());
+        double headMaxY = printable == null ? sheetH : Math.min(sheetH, printable.getMaxY());
         note(notes, "x", wasX, x, printable != null && minX > 0 ? "head" : "media");
         note(notes, "y", wasY, y, printable != null && minY > 0 ? "head" : "media");
-        note(notes, "width", wasW, w, printable != null && maxX < sheetW ? "head" : "media");
-        note(notes, "height", wasH, h, printable != null && maxY < sheetH ? "head" : "media");
+        note(notes, "width", wasW, w, trailingBound(reserveRight, maxX, headMaxX, sheetW));
+        note(notes, "height", wasH, h, trailingBound(reserveBottom, maxY, headMaxY, sheetH));
+    }
+
+    /** Which of the three limits on a trailing edge is the one that actually stopped it. */
+    private static String trailingBound(double reserve, double bound, double headBound,
+            double sheetBound) {
+        if (reserve > 0 && bound >= headBound - 0.05) {
+            return "margin";
+        }
+        return headBound < sheetBound ? "head" : "media";
     }
 
     /** Sub-point moves are rounding, not clamping, and would only add noise to the report. */

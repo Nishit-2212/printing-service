@@ -82,6 +82,23 @@ public final class GeometryCheck {
                         + "'orientation':'landscape'}",
                 3.53, 0, 288, 432);
 
+        // The Meesho invoice, which used to carry zero margins and resolved to exactly the head's
+        // own rectangle — x=3.5 y=0 288x432 against a head of x=3.5 y=0 288x432. Flush on every
+        // edge, no room for the feed's registration tolerance, and it printed shaved along the
+        // upper and left sides. The inset below is the head's 0.049in dead strip plus slack, and
+        // the numbers here are what "there is room" looks like: an origin inside the head's start
+        // and a rectangle that ends before the head's end.
+        // The height matters as much as the origin here, and for a reason that is easy to miss:
+        // this page has no orientation, so it is auto-detected landscape, and on a rotated page
+        // PageFormat reports getImageableX() as paperHeight - (y + height). With height filling to
+        // 428.4 that came to exactly 0 — the document's left-hand edge flush against the sheet's
+        // bottom, which is what was still being shaved. 424.8 leaves 3.6pt there.
+        check("meesho invoice, inset off the head's edge", landscape,
+                "{'size':{'width':4,'height':10,'units':'in'},"
+                        + "'margins':{'top':0.05,'right':0,'bottom':0.05,'left':0.1},"
+                        + "'scale':'fit-to-page'}",
+                7.2, 3.6, 280.8, 424.8);
+
         // The Meesho label as it actually ships: sizeMeans "sheet", which is how QZ read every
         // size. The sheet becomes 6x5.7in and the 4x6 roll is not consulted at all, so the
         // rectangle is 396x396 rather than the square the default reading clamps it to. This is
