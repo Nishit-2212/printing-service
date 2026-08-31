@@ -167,12 +167,26 @@ public final class PrinterConnection {
         return batch;
     }
 
-    private void writeBatch(List<Job> batch) {
+    private void writeBatch(List<Job> collected) {
+        // A cancelled job is dropped here rather than written and then reported as cancelled.
+        // markPrinting is the same claim the document lane makes and settles the race with a
+        // cancel arriving between the queue poll and this write.
+        List<Job> batch = new ArrayList<>(collected.size());
+        for (Job job : collected) {
+            if (job.markPrinting()) {
+                batch.add(job);
+            } else {
+                Log.info("label job " + job.id() + " skipped: " + job.state().wire());
+            }
+        }
+        if (batch.isEmpty()) {
+            return;
+        }
+
         byte[] bytes;
         try {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             for (Job job : batch) {
-                job.markPrinting();
                 for (int i = 0; i < job.copies(); i++) {
                     buf.write(job.payload());
                 }

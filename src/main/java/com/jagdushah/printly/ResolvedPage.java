@@ -93,16 +93,21 @@ public final class ResolvedPage {
     private final String orientationSource;
     private final String scaling;
     private final Double scaleFactor;
+    private final Rectangle2D source;
+    private final boolean contentClipped;
     private final List<Note> notes;
 
     private ResolvedPage(PageFormat pageFormat, Rectangle2D head, String orientationSource,
-            String scaling, Double scaleFactor, List<Note> notes) {
+            String scaling, Double scaleFactor, Rectangle2D source, boolean contentClipped,
+            List<Note> notes) {
         this.pageFormat = pageFormat;
         this.paper = pageFormat.getPaper();
         this.head = head;
         this.orientationSource = orientationSource;
         this.scaling = scaling;
         this.scaleFactor = scaleFactor;
+        this.source = source;
+        this.contentClipped = contentClipped;
         this.notes = List.copyOf(notes);
     }
 
@@ -316,7 +321,62 @@ public final class ResolvedPage {
             String orientationSource, PrintOptions o, PDDocument doc, List<Note> notes) {
         Scaling s = scaling(o);
         Double factor = estimateScale(pf, doc, s);
-        return new ResolvedPage(pf, printable, orientationSource, wire(s.name()), factor, notes);
+        Rectangle2D source = sourcePage(doc);
+        boolean clipped = contentOverflows(pf, source, s);
+        if (clipped) {
+            // Reported, never acted on. Under scale-to-fit this cannot happen at all, so saying it
+            // only when it is true is what keeps "some content will be cut off" from becoming the
+            // next thing nobody believes.
+            notes.add(new Note("warn", "content-clipped", null, null, null, null, String.format(
+                    Locale.ROOT,
+                    "the page is %.2fx%.2f in and the printable area is %.2fx%.2f in, and scaling is "
+                            + "actual-size — whatever falls outside is clipped by the driver",
+                    source.getWidth() / PT_PER_IN, source.getHeight() / PT_PER_IN,
+                    pf.getImageableWidth() / PT_PER_IN, pf.getImageableHeight() / PT_PER_IN)));
+        }
+        return new ResolvedPage(pf, printable, orientationSource, wire(s.name()), factor,
+                source, clipped, notes);
+    }
+
+    /**
+     * The document's own first page, as PDFBox will measure it.
+     *
+     * <p>Reported so a person can be told "your A4 page was shrunk onto a 4x6 label" instead of
+     * being handed two rectangles and left to work out which is which. Page one only, for the same
+     * reason {@link #estimateScale} is: one {@link PageFormat} is bound to the whole document.
+     *
+     * @return null when there is no page to measure
+     */
+    private static Rectangle2D sourcePage(PDDocument doc) {
+        if (doc == null || doc.getNumberOfPages() == 0) {
+            return null;
+        }
+        PDRectangle crop = rotatedCropBox(doc.getPage(0));
+        if (crop.getWidth() <= 0 || crop.getHeight() <= 0) {
+            return null;
+        }
+        return new Rectangle2D.Double(0, 0, crop.getWidth(), crop.getHeight());
+    }
+
+    /**
+     * Whether artwork will actually be cut off, as against merely scaled down.
+     *
+     * <p>The distinction is the whole reason this exists. A clamp means the <em>geometry</em> was
+     * cut down to fit the media; it does not by itself mean any content is lost, because
+     * scale-to-fit then shrinks the artwork into whatever rectangle survived. Content is only
+     * genuinely clipped when nothing is scaling it — {@code scale: "actual"} — and the page is
+     * larger than the rectangle it is being pinned into.
+     *
+     * <p>{@code center=false} on the print path pins the artwork to the top-left, so the loss is
+     * off the right and bottom edges. Half a point of slack is allowed for rounding: a page that
+     * matches its printable area exactly must not be reported as clipped.
+     */
+    private static boolean contentOverflows(PageFormat pf, Rectangle2D source, Scaling scaling) {
+        if (source == null || scaling != Scaling.ACTUAL_SIZE) {
+            return false;
+        }
+        return source.getWidth() > pf.getImageableWidth() + 0.5
+                || source.getHeight() > pf.getImageableHeight() + 0.5;
     }
 
     /**
@@ -621,6 +681,21 @@ public final class ResolvedPage {
     }
 
     /**
+     * The document's own page size in points, or null when there was no page to measure.
+     *
+     * <p>The origin is always 0,0 — only the extent is meaningful. This is the "from" of the
+     * before-and-after a person needs to make sense of a scale factor.
+     */
+    public Rectangle2D sourcePage() {
+        return source;
+    }
+
+    /** True when artwork will be cut off rather than scaled down. See {@code contentOverflows}. */
+    public boolean contentClipped() {
+        return contentClipped;
+    }
+
+    /**
      * True when nothing had to be cut down — the geometry on paper is the geometry asked for.
      *
      * <p>This is what {@code /preflight} turns into a yes or no. A false does not mean the job
@@ -661,6 +736,12 @@ public final class ResolvedPage {
         if (scaleFactor != null) {
             m.put("scaleFactor", scaleFactor);
         }
+        // The document's own page, so a caller can say what was scaled onto what rather than
+        // reporting a bare multiplier.
+        if (source != null) {
+            m.put("source", rect(0, 0, source.getWidth(), source.getHeight()));
+        }
+        m.put("contentClipped", contentClipped);
         m.put("fits", fits());
         m.put("notes", notes.stream().map(Note::toJson).toList());
         return m;

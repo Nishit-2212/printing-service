@@ -10,7 +10,15 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class Job {
 
     public enum State {
-        QUEUED, PRINTING, DONE, FAILED;
+        QUEUED, PRINTING, DONE, FAILED,
+        /**
+         * Pulled out of its queue before the lane reached it.
+         *
+         * <p>Distinct from FAILED because nothing went wrong and nothing needs investigating — an
+         * operator changed their mind about a batch. Both report {@code ok:false}, which is what
+         * matters to a caller deciding whether the paper came out.
+         */
+        CANCELLED;
 
         public String wire() {
             return name().toLowerCase(java.util.Locale.ROOT);
@@ -22,7 +30,8 @@ public final class Job {
     private final String id;
     private final String printer;
     private final String type;
-    private final byte[] payload;
+    private volatile byte[] payload;
+    private final int payloadBytes;
     private final int copies;
     private final PrintOptions options;
     private final long createdAt = System.currentTimeMillis();
@@ -36,12 +45,17 @@ public final class Job {
     private volatile long setupMs = -1;
     private volatile long spoolMs = -1;
     private volatile ResolvedPage page;
+    private volatile String title;
+    private volatile String pagesNote;
+    private volatile String batchId;
+    private volatile String strategy;
 
     public Job(String printer, String type, byte[] payload, int copies, PrintOptions options) {
         this.id = "j_" + Long.toString(SEQ.incrementAndGet(), 36);
         this.printer = printer;
         this.type = type;
         this.payload = payload;
+        this.payloadBytes = payload.length;
         this.copies = copies;
         this.options = options == null ? PrintOptions.NONE : options;
     }
@@ -58,9 +72,44 @@ public final class Job {
         return type;
     }
 
-    /** The single-copy payload. Repetition for {@link #copies()} happens at the lane. */
+    /**
+     * The single-copy payload. Repetition for {@link #copies()} happens at the lane.
+     *
+     * <p>Null once {@link #releasePayload()} has reclaimed it, which only happens to a settled job.
+     * The print path always sees it non-null; only a reprint of an old job can find it gone, and
+     * {@link #reprintable()} is how to ask first.
+     */
     public byte[] payload() {
         return payload;
+    }
+
+    /** How big the payload was, which stays reportable after the bytes themselves are released. */
+    public int payloadBytes() {
+        return payloadBytes;
+    }
+
+    /** True while the bytes are still held, so this job can be sent to the printer again. */
+    public boolean reprintable() {
+        return payload != null;
+    }
+
+    /**
+     * Drop the payload of a finished job.
+     *
+     * <p>The registry keeps the last few hundred jobs so the panel can reprint one, and each of
+     * them was holding its document. Five hundred courier invoices is comfortably more than the
+     * 128 MB heap the service is packaged with, and the failure mode is an OutOfMemoryError that
+     * takes printing down mid-shift — caused by the history feature rather than by any printing.
+     * So the bytes are reclaimed oldest-first past a budget ({@link JobRegistry}); recent jobs stay
+     * reprintable, which is the only part of the history anyone reprints from.
+     *
+     * <p>Only ever called on a settled job: a queued one still has to print, and a printing one may
+     * be retried on a fresh socket by the label lane.
+     */
+    void releasePayload() {
+        if (settled()) {
+            payload = null;
+        }
     }
 
     public int copies() {
@@ -92,6 +141,32 @@ public final class Job {
         this.page = page;
     }
 
+    /**
+     * What a person would call this job — a file name, or "raw label".
+     *
+     * <p>Nothing in the print path reads it. It exists because a recent-jobs list of
+     * {@code j_1 … j_47} on one printer is unusable for the thing an operator actually does with
+     * it, which is find the order that did not come out and reprint it.
+     */
+    public String title() {
+        return title;
+    }
+
+    void describe(String title, String pagesNote) {
+        this.title = title;
+        this.pagesNote = pagesNote;
+    }
+
+    /** Which batch and which strategy rule produced this job, for grouping in the panel. */
+    void attribute(String batchId, String strategy) {
+        this.batchId = batchId;
+        this.strategy = strategy;
+    }
+
+    public String batchId() {
+        return batchId;
+    }
+
     public State state() {
         return state;
     }
@@ -101,7 +176,27 @@ public final class Job {
     }
 
     public boolean settled() {
-        return state == State.DONE || state == State.FAILED;
+        return state == State.DONE || state == State.FAILED || state == State.CANCELLED;
+    }
+
+    /**
+     * Take this job out of its queue, if it has not started.
+     *
+     * <p>Best-effort by design, and the boundary is exact: a job still QUEUED is cancelled here and
+     * its lane skips it when it gets there, which is a real cancel. A job already PRINTING has
+     * bytes in the driver or on the wire and the service cannot recall them — the honest answer is
+     * false, and the caller is told so rather than shown a cancel that did nothing.
+     *
+     * @return true when the job will not print
+     */
+    public synchronized boolean cancel() {
+        if (state != State.QUEUED) {
+            return false;
+        }
+        finishedAt = System.currentTimeMillis();
+        state = State.CANCELLED;
+        settled.countDown();
+        return true;
     }
 
     /**
@@ -152,11 +247,22 @@ public final class Job {
         return startedAt > 0 ? startedAt - createdAt : 0;
     }
 
-    void markPrinting() {
-        if (state == State.QUEUED) {
-            state = State.PRINTING;
-            startedAt = System.currentTimeMillis();
+    /**
+     * Claim the job for a lane.
+     *
+     * <p>Synchronized against {@link #cancel()}, and the reason the two must be: the window
+     * between a lane taking a job off its queue and writing its bytes is exactly where a cancel
+     * arrives, and losing that race in the other direction prints a label the operator cancelled.
+     *
+     * @return false when the job was cancelled first and must be skipped
+     */
+    synchronized boolean markPrinting() {
+        if (state != State.QUEUED) {
+            return state == State.PRINTING;
         }
+        state = State.PRINTING;
+        startedAt = System.currentTimeMillis();
+        return true;
     }
 
     void complete() {
@@ -198,8 +304,21 @@ public final class Job {
         m.put("type", type);
         m.put("state", state.wire());
         m.put("ok", state == State.DONE);
+        if (title != null) {
+            m.put("title", title);
+        }
+        if (pagesNote != null) {
+            m.put("pagesNote", pagesNote);
+        }
+        if (batchId != null) {
+            m.put("batchId", batchId);
+        }
+        if (strategy != null) {
+            m.put("strategy", strategy);
+        }
         m.put("copies", copies);
-        m.put("bytes", payload.length);
+        m.put("bytes", payloadBytes);
+        m.put("reprintable", payload != null);
         m.put("createdAt", createdAt);
         if (startedAt > 0) {
             m.put("startedAt", startedAt);

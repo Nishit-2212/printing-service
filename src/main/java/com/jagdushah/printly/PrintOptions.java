@@ -62,6 +62,7 @@ public final class PrintOptions {
     private Scale scale;
     private double density;
     private String pageRange;
+    private PageSelection pages;
 
     /** The raw units string, kept only so {@link #toJson()} can echo what the caller sent. */
     private String units = "in";
@@ -211,6 +212,29 @@ public final class PrintOptions {
             o.pageRange = cleaned;
         }
 
+        // The capable page selector, and the one a routing strategy uses: "odd", "even",
+        // "1,4-6", "last", plus an optional reversed order for manual duplex. Unlike
+        // "pageRange" above it is not a driver attribute — the service rewrites the PDF down to
+        // the selected pages before anything reaches the lane (see PrintRouter.submit), which is
+        // why it can express what PageRanges cannot and why it cannot be quietly ignored by a
+        // driver. Both are accepted together: pageRange stays a contiguous range handed to the
+        // driver, for the profiles already calibrated with it.
+        String pages = Json.str(m, "pages", null);
+        String pageOrder = Json.str(m, "pageOrder", null);
+        if ((pages != null && !pages.isBlank()) || (pageOrder != null && !pageOrder.isBlank())) {
+            if (pageOrder != null && !pageOrder.isBlank()) {
+                String order = pageOrder.trim().toLowerCase(Locale.ROOT);
+                if (!order.equals("normal") && !order.equals("reverse")) {
+                    throw new IllegalArgumentException("unknown \"pageOrder\" '" + pageOrder
+                            + "' (use normal or reverse)");
+                }
+            }
+            PageSelection selection = PageSelection.parse(pages, pageOrder);
+            // "all" in normal order is what absent already means, so it is not worth carrying
+            // through as a selection that would force a needless re-encode of every document.
+            o.pages = selection.isEverything() ? null : selection;
+        }
+
         return o;
     }
 
@@ -238,7 +262,7 @@ public final class PrintOptions {
     /** True when nothing at all was specified, so the lane can skip building a page format. */
     public boolean isEmpty() {
         return !hasSize && !hasMargins && orientation == null && colorType == null
-                && scale == null && density == 0 && pageRange == null;
+                && scale == null && density == 0 && pageRange == null && pages == null;
     }
 
     public boolean hasSize() {
@@ -308,6 +332,49 @@ public final class PrintOptions {
         return pageRange;
     }
 
+    /**
+     * The page selection to rewrite the document down to, or null for "every page, in order".
+     *
+     * <p>Null rather than {@link PageSelection#ALL} on purpose: the difference between them is
+     * whether a document gets re-encoded before it prints, and the hot path must not pay for a
+     * selection that selects everything.
+     */
+    public PageSelection pages() {
+        return pages;
+    }
+
+    /**
+     * This same geometry with the page selection already spent.
+     *
+     * <p>Once the router has rewritten the document down to the selected pages, the selection has
+     * happened and must not travel with the job: a reprint carries the job's own payload and
+     * options straight back to the lane, and a selection still attached would apply "odd pages"
+     * to a document that is already only the odd pages. That reprints half of half.
+     */
+    public PrintOptions withoutPages() {
+        if (pages == null) {
+            return this;
+        }
+        PrintOptions copy = new PrintOptions();
+        copy.widthPt = widthPt;
+        copy.heightPt = heightPt;
+        copy.hasSize = hasSize;
+        copy.sizeIsSheet = sizeIsSheet;
+        copy.marginTopPt = marginTopPt;
+        copy.marginRightPt = marginRightPt;
+        copy.marginBottomPt = marginBottomPt;
+        copy.marginLeftPt = marginLeftPt;
+        copy.hasMargins = hasMargins;
+        copy.orientation = orientation;
+        copy.colorType = colorType;
+        copy.scale = scale;
+        copy.density = density;
+        copy.pageRange = pageRange;
+        copy.units = units;
+        copy.pages = null;
+        return copy;
+    }
+
     // ------------------------------------------------------------------ reporting
 
     /**
@@ -342,6 +409,12 @@ public final class PrintOptions {
         }
         if (pageRange != null) {
             m.put("pageRange", pageRange);
+        }
+        if (pages != null) {
+            m.put("pages", pages.spec());
+            if (pages.isReversed()) {
+                m.put("pageOrder", "reverse");
+            }
         }
         return m;
     }

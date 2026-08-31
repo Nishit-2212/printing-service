@@ -31,6 +31,10 @@ for %%J in (lib\*.jar) do (
 javac -encoding UTF-8 --release 21 -cp "!CLASSPATH_ARG!" -d build\classes @build\sources.txt
 if errorlevel 1 exit /b 1
 
+REM The Control Panel's HTML/CSS/JS travel inside the jar, so an installed copy has no loose
+REM web assets to go missing. Copied rather than compiled: they have no build step on purpose.
+if exist src\main\resources xcopy /e /i /y /q src\main\resources build\classes\ >nul
+
 REM Class-Path is what makes both `java -jar` and the jpackage launcher find PDFBox.
 REM Without it the app starts fine and then dies on the first PDF.
 > build\manifest.mf echo Class-Path: !MANIFEST_CP!

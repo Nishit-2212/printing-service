@@ -6,6 +6,15 @@ A small always-running local service that accepts print jobs from your web app o
 It replaces QZ Tray for the **label lane**. TSPL goes in, bytes go to the socket, nothing is
 rendered — that is the entire speed story.
 
+There are two ways in, and they are the same engine underneath:
+
+- **From your web app**, over the HTTP API below. This is what the packing flow uses.
+- **From the Control Panel**, a local web UI the service serves at `http://127.0.0.1:9110/`, for
+  bulk printing and station setup without writing any code.
+
+A job from either side is composed by the same code and comes out the same, so a preview in the
+panel is a preview of what the web app will print.
+
 Measured on the bundled mock printer: **200 labels submitted and acknowledged in 228 ms over a
 single reused TCP connection**, 0 failures, 0 interleaving.
 
@@ -49,9 +58,14 @@ whatever bytes arrive.
 --config, -c <path>   configuration file to use
 --port,   -p <n>      override the listening port
 --no-tray             run without a system tray icon
+--no-panel            run without the Control Panel UI and its /api endpoints
 --version, -v
 --help,   -h
 ```
+
+`--no-panel` is for a station whose only client is the web app. Nothing about `/health`,
+`/printers`, `/print`, `/preview`, `/preflight` or `/jobs` changes either way — the panel adds
+endpoints under `/api/` and never alters the ones above.
 
 ---
 
@@ -125,6 +139,43 @@ Unrecognised keys (QZ-only ones like `scaleContent`) are ignored.
 
 Only a single range is accepted for `pageRange`, on purpose: `PrinterJob` honours just the first
 range it is given, so taking a list like `1,4-5` would quietly print page 1 alone.
+
+##### `pages` — the capable page selector
+
+`pageRange` above becomes a `PageRanges` attribute, which is why it is limited to one contiguous
+range. `pages` is the other mechanism, and it can express what a routing strategy needs:
+
+| Value | Selects |
+|-------|---------|
+| `all` (or absent) | every page, in order |
+| `odd` / `even` | 1,3,5… / 2,4,6… — manual duplex on a single-sided printer |
+| `first` / `last` | the first / the last page |
+| `4` | one page |
+| `2-5`, `3-`, `-3` | an inclusive range, open at either end |
+| `every:3`, `every:3+2` | every third page, from the first / from the second |
+| `1,4-6,last` | several terms, unioned |
+
+Add `"pageOrder": "reverse"` to send the selected pages back to front, which is the order that makes
+a face-up output tray come out collated on the second pass of a manual duplex.
+
+The service carries this out by **rewriting the PDF down to the selected pages** before the job
+reaches a lane, rather than by handing the driver an attribute. That is deliberate, and it is the
+same decision the packing flow made in its own `pages.js`: a driver handed a `Printable` may or may
+not honour the attributes alongside it, and finding out which costs a label and a courier bag.
+Trimming the bytes cannot be ignored by anything downstream.
+
+Consequences worth knowing:
+
+- A selection that matches **no page** of the document is a **400**, not a whole-document print. The
+  caller asked for something specific and it is not there.
+- `all` in normal order is dropped rather than carried, so the common case never pays for a
+  re-encode. Everything else costs one load-select-save — single-digit milliseconds on a warehouse
+  PC, against seconds for the print head.
+- The selection is **spent** when the job is created. `GET /jobs/{id}` echoes it as `pagesNote`
+  ("odd (3 of 6 pages)"), and a reprint re-applies nothing — otherwise reprinting "odd pages" would
+  print half of half.
+- `pages` and `pageRange` can be used together: `pages` picks the pages, `pageRange` is still handed
+  to the driver afterwards. Profiles already calibrated with `pageRange` are unaffected.
 
 ##### `size` sets the printable area, not the paper
 
@@ -224,11 +275,165 @@ the page it was failing to print.
 The service always knew all of this. It just never said so, and finding out meant reflecting into a
 private method.
 
+### `GET /jobs/{id}` extras for panel jobs
+
+`title` (the file name), `pagesNote` (what a page selection resolved to), `batchId` and `strategy`
+are present on jobs the Control Panel created, and `reprintable` says whether the service still
+holds the document. All four are absent on a job from the web app, which sends none of them.
+
+`state` gained one value: **`cancelled`**, for a job pulled out of its queue before a lane reached
+it. Like `failed` it reports `ok: false` — the paper did not come out — but nothing went wrong and
+nothing needs investigating.
+
 ### `POST /reconnect` — drop and reopen every printer socket
 
 Errors are always `{ "ok": false, "error": "..." }` with a real status code: 400 bad request,
 403 origin not allowed, 404 unknown printer/job, 413 body too large, 502 print failed,
 503 queue full or the lane did not answer in time.
+
+---
+
+## The Control Panel
+
+A local web UI the service serves at **`http://127.0.0.1:9110/`** — also on the tray menu, under
+*Open Control Panel*. It exists for two people the HTTP API does not serve:
+
+- the operator at the packing bench who needs to print two hundred courier PDFs and has no web app
+  open, and
+- whoever sets a station up, who currently does it by editing JSON and restarting.
+
+It is plain HTML, CSS and JavaScript served out of the jar. No build step and no npm, for the same
+reason the Java build is a bare `javac` over vendored jars: a warehouse build must not depend on the
+network, and there is nothing here that a framework would earn.
+
+### What it does
+
+**Print** — one document. Drop a PDF, pick a printer and a preset, see the plan, preview it against
+the printer's real media, print. Raw TSPL/ESC-POS/ZPL is here too, as plain text, hex pairs or
+base64.
+
+**Bulk** — many documents, one strategy, with progress and a per-file outcome. **Every file is
+planned before any file prints**: a run that cannot be carried out is refused whole, naming the file
+and the reason. The alternative — discovering a bad preset on file forty-one of two hundred — leaves
+forty printed labels and a stack of half-processed orders, and no button recovers from that.
+
+**Printers** — add a networked label printer, probe its socket, print a test label, and see queue
+and failure counts per printer. A printer added here takes effect immediately, with no restart, so
+the station's other printers keep their warm sockets.
+
+**Presets** — the paper geometry from `options`, saved and named, with *Check fit* running a real
+`/preflight` against a chosen printer. That check is what makes these fields safe to expose at all:
+they are hardware-calibrated numbers, and it can say "4x10in will be clamped to 4x6 on this printer"
+without burning a label to find out.
+
+**Strategies** — see below.
+
+**Jobs** — recent jobs with reprint and cancel, and the geometry each one resolved to.
+
+**Settings** — the panel's defaults, the station's facts, and the tail of the log file. The log is
+worth the screen: the packaged build is windowed, so there is no console, and getting at it today
+means talking someone through `%APPDATA%` over the phone while a shift waits.
+
+### Strategies: which pages go to which printer
+
+The one genuinely new capability, as against a nicer front end for something the API already did. A
+strategy is a list of rules, each pairing a page selection (`pages` above) with a printer, a preset
+and a copy count. All of them are applied to every document.
+
+That covers the things an operator cannot express by picking a printer and pressing Print:
+
+| Strategy | Rules |
+|----------|-------|
+| **Manual duplex** on a printer with no duplexer | `odd` → printer A, then `even` reversed → printer A |
+| **Label and invoice split**, one order per file | `first` → the 4x6 thermal roll, `2-` → the office printer |
+| **A copy for the picklist** | `first` → thermal, 2 copies |
+| **Fan-out** | the same pages to two printers, as two rules |
+
+A rule that matches no page of a particular document is **skipped and reported**, not an error:
+`2-` against a one-page Meesho label is a split strategy meeting a file that has no invoice, and
+that is a fact about the file rather than a mistake in the rule. One strategy therefore covers a
+one-page label and a three-page invoice without anyone maintaining two.
+
+A rule that names no printer uses whichever printer is chosen when the strategy runs, which is what
+makes the manual-duplex strategy reusable on any station.
+
+### What it starts with
+
+On first run the panel writes a starting set of presets and strategies — the per-platform profiles
+the packing flow already prints with (Flipkart, Meesho, FirstCry), comments and all. An empty
+Presets screen is a worse first impression than a populated one: the numbers here are not guessable,
+they were calibrated against physical output, and this puts them in front of the person standing at
+the printer instead of only in a web bundle.
+
+Only ever written when the file is absent. Deleting every preset gets you an empty screen, not your
+deletions undone on the next restart.
+
+### Where it keeps things
+
+Flat JSON beside `config.json`, in the same per-user directory:
+
+| File | Holds |
+|------|-------|
+| `presets.json` | saved paper geometry |
+| `strategies.json` | the routing rules |
+| `printers.json` | label printers the panel added |
+| `panel.json` | the panel's own defaults |
+| `spool/` | staged files, emptied at startup |
+
+**The panel never writes `config.json`.** That file is hand-edited, and several of its comments are
+the reason a value is what it is; a UI that rewrote it would drop every one of them the first time
+someone added a printer. So the two printer lists are merged at startup, `config.json` winning a
+name clash, and the panel refuses to edit or delete anything defined there — it says where the
+definition lives instead. Deleting the four files above is a complete undo of everything the UI ever
+did to a station.
+
+### Its endpoints
+
+All under `/api/`, so they cannot collide with the printing contract above — that contract has a
+published client whose major version tracks it, and a panel feature must never be a reason to bump
+it.
+
+| Endpoint | Does |
+|----------|------|
+| `GET /api/state` | everything the panel needs, in one call |
+| `GET`/`POST` `/api/printers`, `/api/printers/delete` | list, add or remove a label printer |
+| `POST /api/printers/probe` | open a socket to an address and close it again |
+| `POST /api/printers/test-label` | print a small TSPL label, to prove the path end to end |
+| `GET`/`POST` `/api/presets`, `/api/presets/delete` | preset CRUD, refusing geometry that does not parse |
+| `GET`/`POST` `/api/strategies`, `/api/strategies/delete` | strategy CRUD, refusing rules that cannot resolve |
+| `POST /api/files` | stage one PDF (`application/pdf` body, `?name=`), returning its page count |
+| `GET /api/files`, `POST /api/files/delete` | the staging area |
+| `POST /api/plan` | what a strategy would do to these files. Prints nothing |
+| `POST /api/print` | one print, document or raw, through the same router as `POST /print` |
+| `POST /api/preview`, `/api/preflight` | as above, with a page selection applied first |
+| `POST /api/batches`, `GET /api/batches/{id}`, `POST /api/batches/{id}/cancel` | bulk runs |
+| `GET /api/jobs`, `POST /api/jobs/{id}/reprint`, `POST /api/jobs/{id}/cancel` | history |
+| `GET`/`POST` `/api/settings` | the panel's defaults |
+| `GET /api/log?lines=` | the tail of the log file |
+
+Two things about them worth knowing:
+
+- The panel's own origin (`http://127.0.0.1:<port>`) is trusted unconditionally, whatever
+  `allowedOrigins` says. A station that tightened the list for its web app would otherwise lock the
+  operator out of the panel on the same machine, with a 403 that looks like a bug in the panel.
+- `POST /api/files` accepts a larger body than `maxBodyBytes`, which bounds what a *web page* may
+  post. This is a person choosing a file in a picker on the same machine, and staged files go to
+  disk rather than into the heap.
+
+### Why no WebSocket
+
+The Phase 1 technical design put a WebSocket at the front of the service, with RSA-signed calls and
+a trusted-certificate store, because that is what QZ Tray does — and QZ has to, since a browser can
+only open `wss://` from an HTTPS page. That certificate is named in the design's own risk register
+as *"the single most awkward part of this whole build"*, and it is awkward per machine, for ever.
+
+This service already avoids all of it (see *Why no TLS* below), so the panel is built on the
+transport that exists rather than a second one beside it. Everything the design wanted from the
+socket is still here: two front-ends on one engine, the panel as an ordinary client rather than a
+special case, and live state — by polling, which for a page on the same machine is a nicer
+implementation question rather than a user-visible one. The only thing genuinely given up is
+signature verification, which gated *unknown web pages* rather than the panel, and which
+`allowedOrigins` does here.
 
 ---
 
@@ -388,7 +593,13 @@ against physical output on every printer model.
 | Non-ASCII text prints wrong | Set the printer's `charset` to its codepage |
 | Labels garbled under two operators | Should be impossible — per-printer serialization prevents it; check for a second bridge instance |
 | First print after a long idle fails | Lower `idleCheckMs` |
-| Nothing in the console on Windows | The packaged build is windowed; read `%APPDATA%\Printly\printly.log` |
+| Nothing in the console on Windows | The packaged build is windowed; read `%APPDATA%\Printly\printly.log`, or the Log panel under Settings |
+| The Control Panel will not load | Check `/health` answers. If the page loads but every action 403s, the service is older than the panel — the panel's own origin is trusted from this version on |
+| A printer cannot be edited in the panel | It is defined in `config.json`, which the panel never rewrites so its comments survive. Edit it there and restart |
+| "Test the connection" says already connected | The service is holding that printer's one socket. That answer *is* the liveness check — a fresh probe would have to steal the connection to run |
+| A bulk run refused to start | One of the files could not be planned; the message names it. Nothing printed — that is the design, not a failure |
+| Only some rules of a strategy printed | A rule that matches no page of that document is skipped and reported. A `2-` invoice rule against a one-page label is the usual case |
+| A reprint says the document is no longer held | The history keeps recent documents within a byte budget so a shift of invoices cannot exhaust the 128 MB heap. Print the file again |
 
 ## Layout
 
@@ -405,14 +616,38 @@ src/main/java/com/jagdushah/printly/
   ResolvedPage.java       what those options resolved to on the real media, and every clamp
   PagePreview.java        the same composition and renderer, aimed at a PNG instead of a driver
   Job.java / JobRegistry.java   job state and recent-job lookup
+  PageSelection.java      which pages a rule applies to: odd, even, 2-5, every:3
+  PdfSplitter.java        rewriting a PDF down to those pages, and reading its page count
+  Strategy.java           a routing strategy resolved into per-printer steps
+  BatchRunner.java        bulk runs: plan every file, then print with progress and cancel
+  Store.java              the panel's presets, strategies, printers and settings, as JSON
+  Spool.java              staged files, on disk so a 200-file batch is not a heap problem
+  ControlPanel.java       the /api endpoints and the served web UI
   TrayUi.java             system tray status, reconnect, quit
   Log.java                rotating file + console log
   Json.java               dependency-free JSON reader/writer
+src/main/resources/ui/    the Control Panel page — index.html, styles.css, app.js
 lib/                      vendored jars, committed — see below
 tools/MockPrinter.java    fake TSPL printer for testing without hardware
 tools/GeometryCheck.java  the calibrated profiles, asserted against measured
                           printer geometry — no hardware, exits non-zero on drift
+tools/StrategyCheck.java  page selections, PDF splitting and strategy resolution,
+                          asserted against known-good answers — no hardware either
 ```
+
+The panel's three web files are copied into the jar by the build, so an installed copy has no loose
+web assets to go missing or be edited into a state nobody can reproduce.
+
+Run the routing checks after touching `PageSelection`, `PdfSplitter` or `Strategy`:
+
+```bat
+javac -encoding UTF-8 -d build\check -cp "build\classes;lib\pdfbox-2.0.37.jar;lib\fontbox-2.0.37.jar;lib\commons-logging-1.2.jar" tools\StrategyCheck.java
+java -cp "build\check;build\classes;lib\pdfbox-2.0.37.jar;lib\fontbox-2.0.37.jar;lib\commons-logging-1.2.jar" com.jagdushah.printly.StrategyCheck
+```
+
+71 assertions, no printers, no paper, exits non-zero on drift. Geometry decides where ink lands; a
+strategy decides which printer it lands on and which pages go there, and across a two-hundred-file
+run that is the more expensive of the two to discover late.
 
 One third-party dependency, and only for the document lane: **Apache PDFBox 2.0.x**
 (`pdfbox`, `fontbox`, `commons-logging`, ~4.4 MB). Everything else is

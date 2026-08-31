@@ -21,11 +21,23 @@ public final class PrintRouter {
         }
     }
 
-    private final Map<String, PrinterConnection> byName = new LinkedHashMap<>();
+    /**
+     * The label printers, by lower-cased name.
+     *
+     * <p>Concurrent rather than a plain map because the Control Panel can add and remove printers
+     * while a shift is running, and the alternative — restart the service to pick up a new IP — is
+     * exactly the friction the panel exists to remove. Display order is by name (see
+     * {@link #labelPrinters()}) rather than insertion, which is also the order a person looks for
+     * a printer in.
+     */
+    private final Map<String, PrinterConnection> byName = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Config config;
     private final DocumentLane documents;
     private final JobRegistry jobs;
+    private volatile boolean started;
 
     public PrintRouter(Config config) {
+        this.config = config;
         for (PrinterTarget target : config.printers) {
             byName.put(target.name().toLowerCase(Locale.ROOT), new PrinterConnection(target, config));
         }
@@ -34,7 +46,46 @@ public final class PrintRouter {
     }
 
     public void start() {
+        started = true;
         byName.values().forEach(PrinterConnection::start);
+    }
+
+    /**
+     * Add or replace a label printer without a restart.
+     *
+     * <p>Replacing means the old connection is shut down first, which fails anything still queued
+     * on it. That is the right trade: the printer being replaced is one whose address just changed,
+     * so a job queued for the old address was never going to come out anyway, and leaving a worker
+     * holding a socket to an IP nobody uses is how a station ends up with two things fighting over
+     * one printer's single connection slot.
+     */
+    public synchronized void addLabelPrinter(PrinterTarget target) {
+        String key = target.name().toLowerCase(Locale.ROOT);
+        PrinterConnection previous = byName.remove(key);
+        if (previous != null) {
+            previous.shutdown();
+        }
+        PrinterConnection connection = new PrinterConnection(target, config);
+        byName.put(key, connection);
+        if (started) {
+            connection.start();
+        }
+        Log.info("label printer '" + target.name() + "' -> " + target.address()
+                + (previous == null ? " added" : " replaced"));
+    }
+
+    /** @return true when a printer of that name was there to remove */
+    public synchronized boolean removeLabelPrinter(String name) {
+        if (name == null) {
+            return false;
+        }
+        PrinterConnection removed = byName.remove(name.toLowerCase(Locale.ROOT));
+        if (removed == null) {
+            return false;
+        }
+        removed.shutdown();
+        Log.info("label printer '" + name + "' removed");
+        return true;
     }
 
     public JobRegistry jobs() {
@@ -65,6 +116,18 @@ public final class PrintRouter {
      *                Label jobs ignore it — TSPL carries its own geometry in the command stream.
      */
     public Job submit(String printerName, String type, byte[] payload, int copies, PrintOptions options) {
+        return submit(printerName, type, payload, copies, options, null, null, null);
+    }
+
+    /**
+     * Submit with the labelling the Control Panel needs on top.
+     *
+     * <p>{@code title}, {@code batchId} and {@code strategy} are metadata only — nothing in the
+     * print path reads them. They are what turns the recent-jobs list from a column of {@code j_*}
+     * ids into something an operator can use to find the order that did not come out.
+     */
+    public Job submit(String printerName, String type, byte[] payload, int copies, PrintOptions options,
+            String title, String batchId, String strategy) {
         // Route before registering. A rejected job would otherwise sit in the registry as QUEUED
         // for ever, since the caller gets an exception rather than the id needed to poll it.
         if (isDocumentType(type)) {
@@ -74,7 +137,32 @@ public final class PrintRouter {
             if (!documents.has(printerName)) {
                 throw new RejectedException(404, "no OS printer named '" + printerName + "'");
             }
+
+            // A page selection is spent here, before the job exists, so that everything downstream
+            // — the lane, the preview, a reprint — sees an ordinary document that happens to be
+            // the pages that were asked for. Doing it any later would mean every one of those
+            // paths having to know about selections, and a reprint re-applying one.
+            String pagesNote = null;
+            PageSelection selection = options.pages();
+            if (selection != null) {
+                try {
+                    PdfSplitter.Applied applied = PdfSplitter.apply(payload, selection);
+                    pagesNote = selection.describe(applied.sourcePages());
+                    payload = applied.pdf();
+                    options = options.withoutPages();
+                } catch (IllegalArgumentException e) {
+                    // The selection matched no page of this document. A 400: the caller asked for
+                    // something specific and it is not there, and printing the whole document
+                    // instead would be the wrong paper coming out of the wrong printer.
+                    throw new RejectedException(400, e.getMessage());
+                } catch (java.io.IOException e) {
+                    throw new RejectedException(400, "could not read the PDF: " + e.getMessage());
+                }
+            }
+
             Job job = new Job(printerName, type, payload, copies, options);
+            job.describe(title, pagesNote);
+            job.attribute(batchId, strategy);
             jobs.put(job);
             if (!documents.submit(job)) {
                 String reason = "document queue for '" + printerName
@@ -91,6 +179,8 @@ public final class PrintRouter {
             throw new RejectedException(404, "no label printer named '" + printerName + "' in config.json");
         }
         Job job = new Job(printerName, type, payload, copies, options);
+        job.describe(title, null);
+        job.attribute(batchId, strategy);
         jobs.put(job);
         if (!connection.submit(job)) {
             String reason = "queue for '" + printerName + "' is full — printer is not keeping up";
@@ -135,7 +225,7 @@ public final class PrintRouter {
 
     public List<Map<String, Object>> listPrinters() {
         List<Map<String, Object>> out = new ArrayList<>();
-        for (PrinterConnection c : byName.values()) {
+        for (PrinterConnection c : labelPrinters()) {
             out.add(c.status());
         }
         if (documents != null) {
@@ -146,14 +236,17 @@ public final class PrintRouter {
 
     public Map<String, Object> labelStatuses() {
         Map<String, Object> m = new LinkedHashMap<>();
-        for (PrinterConnection c : byName.values()) {
+        for (PrinterConnection c : labelPrinters()) {
             m.put(c.target().name(), c.online() ? "online" : "offline");
         }
         return m;
     }
 
+    /** Every label printer, by name, so both the tray and {@code /printers} read in one order. */
     public List<PrinterConnection> labelPrinters() {
-        return new ArrayList<>(byName.values());
+        List<PrinterConnection> out = new ArrayList<>(byName.values());
+        out.sort((a, b) -> a.target().name().compareToIgnoreCase(b.target().name()));
+        return out;
     }
 
     public void reconnectAll() {

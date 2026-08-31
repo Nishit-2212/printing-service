@@ -20,6 +20,12 @@ MANIFEST_CP=$(find lib -name '*.jar' | sort | tr '\n' ' ')
 find src/main/java -name '*.java' > "$OUT/sources.txt"
 javac -encoding UTF-8 --release 21 -Xlint:all -cp "$CLASSPATH_ARG" -d "$OUT/classes" "@$OUT/sources.txt"
 
+# The Control Panel's HTML/CSS/JS travel inside the jar, so an installed copy has no loose web
+# assets to go missing. Copied rather than compiled: there is no build step for them on purpose.
+if [ -d src/main/resources ]; then
+  cp -R src/main/resources/. "$OUT/classes/"
+fi
+
 # Class-Path is what makes both `java -jar` and the jpackage launcher find PDFBox.
 # Without it the app starts fine and then dies on the first PDF.
 printf 'Class-Path: %s\n' "$MANIFEST_CP" > "$OUT/manifest.mf"

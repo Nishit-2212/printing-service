@@ -11,13 +11,14 @@ import java.util.concurrent.CountDownLatch;
 /** Entry point: load config, open the loopback API, keep a warm socket per printer, sit in the tray. */
 public final class Main {
 
-    public static final String VERSION = "1.0.1";
+    public static final String VERSION = "1.2.0";
 
     private static final CountDownLatch STOP = new CountDownLatch(1);
 
     public static void main(String[] args) {
         String configPath = null;
         boolean tray = true;
+        boolean panel = true;
         Integer portOverride = null;
 
         for (int i = 0; i < args.length; i++) {
@@ -25,6 +26,7 @@ public final class Main {
                 case "--config", "-c" -> configPath = next(args, ++i, "--config");
                 case "--port", "-p" -> portOverride = Integer.parseInt(next(args, ++i, "--port"));
                 case "--no-tray" -> tray = false;
+                case "--no-panel" -> panel = false;
                 case "--version", "-v" -> {
                     System.out.println("Printly " + VERSION);
                     return;
@@ -65,8 +67,25 @@ public final class Main {
                     + "Add your app's origin to " + config.file + " once the URL is settled.");
         }
 
+        // The Control Panel's own store, and the label printers it owns. Merged into the config
+        // rather than written back into config.json, so that file keeps its comments — see
+        // Config.withExtraPrinters.
+        Store store = new Store(Config.userDir());
+        if (panel) {
+            store.seedIfEmpty();
+            config = config.withExtraPrinters(store.labelPrinters());
+        }
+
         PrintRouter router = new PrintRouter(config);
-        HttpApi api = new HttpApi(config, router);
+
+        ControlPanel controlPanel = null;
+        BatchRunner batchRunner = null;
+        if (panel) {
+            Spool spool = new Spool(Config.userDir().resolve("spool"), ControlPanel.MAX_SPOOL_BYTES);
+            batchRunner = new BatchRunner(router, spool);
+            controlPanel = new ControlPanel(config, router, store, spool, batchRunner);
+        }
+        HttpApi api = new HttpApi(config, router, controlPanel);
 
         // Claim the port *before* opening any printer socket. A second accidental launch must
         // not connect to the printers at all: they accept one connection, and stealing it would
@@ -91,24 +110,29 @@ public final class Main {
 
         Log.info("listening on http://" + config.bindAddress + ":" + config.port
                 + "  (endpoints: /health, /printers, /print, /jobs/{id})");
+        if (panel) {
+            Log.info("Control Panel: http://" + config.bindAddress + ":" + config.port + "/");
+        }
 
         TrayUi trayUi = null;
         if (tray) {
-            trayUi = new TrayUi(config, router, Main::requestStop);
+            trayUi = new TrayUi(config, router, panel, Main::requestStop);
             if (!trayUi.install()) {
                 trayUi = null;
             }
         }
 
         final TrayUi installedTray = trayUi;
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> shutdown(api, router, installedTray), "shutdown"));
+        final BatchRunner installedBatches = batchRunner;
+        Runtime.getRuntime().addShutdownHook(
+                new Thread(() -> shutdown(api, router, installedTray, installedBatches), "shutdown"));
 
         try {
             STOP.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        shutdown(api, router, installedTray);
+        shutdown(api, router, installedTray, installedBatches);
         System.exit(0);
     }
 
@@ -119,7 +143,8 @@ public final class Main {
 
     private static boolean shuttingDown = false;
 
-    private static synchronized void shutdown(HttpApi api, PrintRouter router, TrayUi tray) {
+    private static synchronized void shutdown(HttpApi api, PrintRouter router, TrayUi tray,
+            BatchRunner batches) {
         if (shuttingDown) {
             return;
         }
@@ -129,6 +154,11 @@ public final class Main {
             tray.remove();
         }
         api.stop();
+        // Before the router, so a running batch stops submitting rather than racing the lanes as
+        // they shut down and reporting every remaining file as a printer failure.
+        if (batches != null) {
+            batches.shutdown();
+        }
         router.shutdown();
     }
 
@@ -168,6 +198,7 @@ public final class Main {
                   --config, -c <path>   configuration file to use
                   --port,   -p <n>      override the listening port
                   --no-tray             run without a system tray icon
+                  --no-panel            run without the Control Panel UI and its endpoints
                   --version, -v         print the version and exit
                   --help,   -h          show this message
                 """);

@@ -72,11 +72,15 @@ public final class Config {
 
     /** Copy with a different listening port, for the {@code --port} command-line override. */
     private Config(Config base, int port) {
+        this(base, port, base.printers);
+    }
+
+    private Config(Config base, int port, List<PrinterTarget> printers) {
         this.file = base.file;
         this.bindAddress = base.bindAddress;
         this.port = port;
         this.allowedOrigins = base.allowedOrigins;
-        this.printers = base.printers;
+        this.printers = List.copyOf(printers);
         this.connectTimeoutMs = base.connectTimeoutMs;
         this.idleCheckMs = base.idleCheckMs;
         this.queueCapacity = base.queueCapacity;
@@ -88,6 +92,36 @@ public final class Config {
 
     public Config withPort(int port) {
         return new Config(this, port);
+    }
+
+    /**
+     * This config plus the label printers the Control Panel owns.
+     *
+     * <p>Two sources on purpose. {@code config.json} is hand-written, commented, and the record of
+     * how a station was set up; a UI that rewrote it would drop every comment the first time
+     * someone added a printer, including the ones that explain why a value is what it is. So the
+     * panel keeps its own {@code printers.json} and the lists are merged here, with
+     * {@code config.json} winning a name clash — the file a person edited deliberately outranks
+     * one a UI wrote.
+     */
+    public Config withExtraPrinters(List<PrinterTarget> extra) {
+        if (extra.isEmpty()) {
+            return this;
+        }
+        List<PrinterTarget> merged = new ArrayList<>(printers);
+        Set<String> taken = new LinkedHashSet<>();
+        for (PrinterTarget t : printers) {
+            taken.add(t.name().toLowerCase(Locale.ROOT));
+        }
+        for (PrinterTarget t : extra) {
+            if (taken.add(t.name().toLowerCase(Locale.ROOT))) {
+                merged.add(t);
+            } else {
+                Log.warn("printer '" + t.name() + "' is in both config.json and printers.json — "
+                        + "using the one in config.json");
+            }
+        }
+        return new Config(this, port, merged);
     }
 
     private static int clamp(int value, int min, int max) {
@@ -112,10 +146,26 @@ public final class Config {
             // Non-browser callers (curl, the tray's own self-check) send no Origin.
             return true;
         }
+        String normalized = normalizeOrigin(origin);
+        // The Control Panel is served by this service, from this port, so its own fetches carry
+        // this origin. It is trusted unconditionally — "our own Control Panel is trusted by
+        // default" — and must not depend on someone having listed it in allowedOrigins: a station
+        // that tightened the list for its web app would otherwise lock the operator out of the
+        // panel on the same machine, with a 403 that looks like a bug in the panel.
+        if (isOwnOrigin(normalized)) {
+            return true;
+        }
         if (allowedOrigins.isEmpty()) {
             return true;
         }
-        return allowedOrigins.contains(normalizeOrigin(origin));
+        return allowedOrigins.contains(normalized);
+    }
+
+    /** True for this service's own address, on either spelling of loopback. */
+    private boolean isOwnOrigin(String normalized) {
+        return normalized.equals("http://127.0.0.1:" + port)
+                || normalized.equals("http://localhost:" + port)
+                || normalized.equals("http://[::1]:" + port);
     }
 
     // ------------------------------------------------------------------ loading

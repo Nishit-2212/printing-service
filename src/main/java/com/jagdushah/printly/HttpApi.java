@@ -35,13 +35,21 @@ public final class HttpApi {
 
     private final Config config;
     private final PrintRouter router;
+    private final ControlPanel panel;
     private final long startedAt = System.currentTimeMillis();
     private HttpServer server;
     private ExecutorService pool;
 
-    public HttpApi(Config config, PrintRouter router) {
+    /**
+     * @param panel the Control Panel, or null to run headless as the pre-panel builds did.
+     *              Null is not a degraded mode: a station whose only client is the web app needs
+     *              nothing the panel adds, and {@code /health}, {@code /printers} and {@code /print}
+     *              behave identically either way.
+     */
+    public HttpApi(Config config, PrintRouter router, ControlPanel panel) {
         this.config = config;
         this.router = router;
+        this.panel = panel;
     }
 
     public void start() throws IOException {
@@ -69,7 +77,14 @@ public final class HttpApi {
         server.createContext("/preflight", wrap(this::handlePreflight));
         server.createContext("/jobs", wrap(this::handleJobs));
         server.createContext("/reconnect", wrap(this::handleReconnect));
-        server.createContext("/", wrap(this::handleNotFound));
+        if (panel != null) {
+            // The Control Panel's own endpoints. Kept under /api/ so they cannot collide with the
+            // printing contract above — that contract has a published client (`printly-web`) whose
+            // major version tracks it, and a panel feature must never be a reason to bump it.
+            server.createContext("/api", wrap(panel::handleApi));
+            server.createContext("/ui", wrap(panel::handleUi));
+        }
+        server.createContext("/", wrap(this::handleRoot));
         server.start();
     }
 
@@ -137,7 +152,7 @@ public final class HttpApi {
         void handle(HttpExchange exchange) throws Exception;
     }
 
-    private static final class BadRequestException extends RuntimeException {
+    static final class BadRequestException extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
         final int status;
@@ -347,9 +362,22 @@ public final class HttpApi {
         return m;
     }
 
-    private void handleNotFound(HttpExchange exchange) throws IOException {
+    /**
+     * The catch-all: the Control Panel at the root, a JSON 404 everywhere else.
+     *
+     * <p>Only the exact root serves the panel. Anything else that reaches here is a caller with the
+     * wrong path, and answering that with an HTML page instead of a JSON error would turn a typo in
+     * a fetch URL into "the response was not JSON", which is a much longer way to the same fix.
+     */
+    private void handleRoot(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        if (panel != null && ("/".equals(path) || "/index.html".equals(path))) {
+            panel.handleUi(exchange);
+            return;
+        }
         respond(exchange, 404, error("no such endpoint — try /health, /printers, /print, "
-                + "/preview, /preflight, /jobs/{id}"));
+                + "/preview, /preflight, /jobs/{id}"
+                + (panel == null ? "" : ", or / for the Control Panel")));
     }
 
     // ------------------------------------------------------------------ payload decoding
@@ -387,13 +415,13 @@ public final class HttpApi {
 
     // ------------------------------------------------------------------ helpers
 
-    private static void requirePost(HttpExchange exchange) {
+    static void requirePost(HttpExchange exchange) {
         if (!"POST".equalsIgnoreCase(exchange.getRequestMethod())) {
             throw new BadRequestException(405, "use POST for " + exchange.getRequestURI().getPath());
         }
     }
 
-    private static byte[] readBody(HttpExchange exchange, int max) throws IOException {
+    static byte[] readBody(HttpExchange exchange, int max) throws IOException {
         try (InputStream is = exchange.getRequestBody()) {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             byte[] chunk = new byte[8192];
@@ -408,7 +436,7 @@ public final class HttpApi {
         }
     }
 
-    private static Map<String, String> query(URI uri) {
+    static Map<String, String> query(URI uri) {
         Map<String, String> out = new LinkedHashMap<>();
         String q = uri.getRawQuery();
         if (q == null || q.isEmpty()) {
@@ -423,7 +451,7 @@ public final class HttpApi {
         return out;
     }
 
-    private static long parseLong(String s, long fallback) {
+    static long parseLong(String s, long fallback) {
         if (s == null || s.isBlank()) {
             return fallback;
         }
@@ -434,14 +462,14 @@ public final class HttpApi {
         }
     }
 
-    private static Map<String, Object> error(String message) {
+    static Map<String, Object> error(String message) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("ok", false);
         m.put("error", message);
         return m;
     }
 
-    private static void respond(HttpExchange exchange, int status, Object body) throws IOException {
+    static void respond(HttpExchange exchange, int status, Object body) throws IOException {
         byte[] bytes = Json.write(body).getBytes(StandardCharsets.UTF_8);
         Headers h = exchange.getResponseHeaders();
         h.set("Content-Type", "application/json; charset=utf-8");

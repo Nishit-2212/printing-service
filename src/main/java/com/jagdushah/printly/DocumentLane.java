@@ -421,7 +421,13 @@ public final class DocumentLane {
 
         @Override
         public void run(Lane lane) throws Exception {
-            job.markPrinting();
+            // Cancelled while it sat in the queue. Skipping it here is what makes the panel's
+            // cancel real rather than cosmetic: the job is already settled, so there is nothing
+            // to report and nothing to print.
+            if (!job.markPrinting()) {
+                Log.info("document job " + job.id() + " skipped: " + job.state().wire());
+                return;
+            }
             lane.print(job);
             job.complete();
             Log.info("document job " + job.id() + " done: printer='" + job.printer() + "' "

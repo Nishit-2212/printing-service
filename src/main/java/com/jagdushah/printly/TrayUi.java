@@ -29,6 +29,7 @@ public final class TrayUi {
     private final Config config;
     private final PrintRouter router;
     private final Runnable onQuit;
+    private final boolean panel;
 
     private TrayIcon icon;
     private MenuItem headerItem;
@@ -36,9 +37,10 @@ public final class TrayUi {
     private javax.swing.Timer refresh;
     private Boolean lastAllOnline;
 
-    public TrayUi(Config config, PrintRouter router, Runnable onQuit) {
+    public TrayUi(Config config, PrintRouter router, boolean panel, Runnable onQuit) {
         this.config = config;
         this.router = router;
+        this.panel = panel;
         this.onQuit = onQuit;
     }
 
@@ -72,6 +74,16 @@ public final class TrayUi {
                 menu.add(none);
             }
             menu.addSeparator();
+
+            if (panel) {
+                // First item under the printer list, because it is the one an operator wants: the
+                // tray is where they notice something is wrong, and the panel is where they fix it.
+                MenuItem openPanel = new MenuItem("Open Control Panel");
+                openPanel.setFont(openPanel.getFont() == null ? null : openPanel.getFont().deriveFont(java.awt.Font.BOLD));
+                openPanel.addActionListener(e -> browse("http://" + config.bindAddress + ":" + config.port + "/"));
+                menu.add(openPanel);
+                menu.addSeparator();
+            }
 
             MenuItem reconnect = new MenuItem("Reconnect all printers");
             reconnect.addActionListener(e -> router.reconnectAll());
@@ -128,6 +140,29 @@ public final class TrayUi {
         long up = router.labelPrinters().stream().filter(PrinterConnection::online).count();
         return "Printly — " + up + "/" + total + " printers online\n"
                 + "http://" + config.bindAddress + ":" + config.port;
+    }
+
+    /**
+     * Open the Control Panel in the default browser.
+     *
+     * <p>{@code Desktop.browse} first; on a Linux desktop without the AWT Desktop integration it
+     * falls back to {@code xdg-open}. A failure is logged rather than shown: the tooltip already
+     * carries the address, so the worst case is someone typing it.
+     */
+    private static void browse(String url) {
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(java.net.URI.create(url));
+                return;
+            }
+        } catch (IOException | RuntimeException e) {
+            Log.warn("could not open " + url + " with the desktop browser: " + e);
+        }
+        try {
+            new ProcessBuilder("xdg-open", url).start();
+        } catch (IOException | RuntimeException e) {
+            Log.warn("could not open " + url + ": " + e + " — open it by hand");
+        }
     }
 
     private static Dimension iconSize() {

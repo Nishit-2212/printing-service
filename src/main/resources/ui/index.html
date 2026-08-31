@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Printly — Control Panel</title>
+<link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="name">Printly</span>
+    <span class="version" id="version"></span>
+  </div>
+  <div class="topbar-status">
+    <span class="pill" id="lane-status">checking…</span>
+    <button class="ghost" id="reconnect" title="Drop and reopen every label printer socket">Reconnect printers</button>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="sidenav" id="nav">
+    <button class="navitem active" data-view="print">
+      <span class="navlabel">Print</span>
+      <span class="navhint">One file, right now</span>
+    </button>
+    <button class="navitem" data-view="bulk">
+      <span class="navlabel">Bulk</span>
+      <span class="navhint">Many files, one strategy</span>
+      <span class="badge" id="badge-bulk" hidden></span>
+    </button>
+    <button class="navitem" data-view="printers">
+      <span class="navlabel">Printers</span>
+      <span class="navhint">Set up and test</span>
+    </button>
+    <button class="navitem" data-view="presets">
+      <span class="navlabel">Presets</span>
+      <span class="navhint">Saved paper geometry</span>
+    </button>
+    <button class="navitem" data-view="strategies">
+      <span class="navlabel">Strategies</span>
+      <span class="navhint">Page → printer rules</span>
+    </button>
+    <button class="navitem" data-view="jobs">
+      <span class="navlabel">Jobs</span>
+      <span class="navhint">History, reprint, cancel</span>
+    </button>
+    <button class="navitem" data-view="settings">
+      <span class="navlabel">Settings</span>
+      <span class="navhint">Defaults and diagnostics</span>
+    </button>
+  </nav>
+
+  <main class="content">
+
+    <!-- ============================================================ PRINT -->
+    <section class="view" id="view-print">
+      <div class="viewhead">
+        <h1>Print</h1>
+        <p class="sub">A single document, with a plan you can see before anything comes out.</p>
+      </div>
+
+      <div class="cols">
+        <div class="col">
+          <div class="card">
+            <h2>1 · The document</h2>
+            <div class="drop" id="print-drop">
+              <input type="file" id="print-file" accept="application/pdf,.pdf" hidden>
+              <p><strong>Drop a PDF here</strong> or <button class="link" id="print-browse">choose a file</button></p>
+              <p class="muted">Nothing is sent to a printer until you press Print.</p>
+            </div>
+            <div id="print-fileinfo" class="fileinfo" hidden></div>
+
+            <details class="raw">
+              <summary>Send raw printer commands instead (TSPL, ESC/POS, ZPL)</summary>
+              <p class="muted">Straight to the printer's socket, nothing rendered. This is the fast
+                path for labels — and the one where the commands are yours to get right.</p>
+              <label class="field">
+                <span>Format of what you paste</span>
+                <select id="raw-encoding">
+                  <option value="utf8">Plain text</option>
+                  <option value="hex">Hex pairs (1B 40 …)</option>
+                  <option value="base64">Base64</option>
+                </select>
+              </label>
+              <textarea id="raw-data" rows="7" spellcheck="false"
+                placeholder="SIZE 50 mm,25 mm&#10;GAP 2 mm,0&#10;CLS&#10;TEXT 16,16,&quot;3&quot;,0,1,1,&quot;HELLO&quot;&#10;PRINT 1,1"></textarea>
+            </details>
+          </div>
+
+          <div class="card">
+            <h2>2 · Where it goes</h2>
+            <label class="field">
+              <span>Printer</span>
+              <select id="print-printer"></select>
+            </label>
+            <label class="field">
+              <span>Preset <small>paper size, margins, colour, dpi</small></span>
+              <select id="print-preset"></select>
+            </label>
+            <details class="adjust" id="print-adjust">
+              <summary>Adjust the paper for this print</summary>
+              <p class="muted">Starts from the preset above and overrides it for this job only.
+                The preview redraws as you change these. <button class="link" id="adjust-save">Save
+                as a new preset</button> once it looks right.</p>
+
+              <h4>Paper</h4>
+              <div class="row wrap">
+                <label class="field small"><span>Width</span>
+                  <input type="number" id="adj-width" step="0.01" min="0" placeholder="preset"></label>
+                <label class="field small"><span>Height</span>
+                  <input type="number" id="adj-height" step="0.01" min="0" placeholder="preset"></label>
+                <label class="field small"><span>Units</span>
+                  <select id="adj-units">
+                    <option value="in">inches</option><option value="mm">mm</option>
+                    <option value="cm">cm</option><option value="pt">points</option>
+                  </select></label>
+                <label class="field"><span>Size means</span>
+                  <select id="adj-sizemeans">
+                    <option value="">A rectangle on the loaded paper</option>
+                    <option value="sheet">The paper itself (QZ Tray's reading)</option>
+                  </select></label>
+              </div>
+
+              <h4>Margins</h4>
+              <div class="row wrap">
+                <label class="field small"><span>Top</span>
+                  <input type="number" id="adj-mtop" step="0.01" min="0" placeholder="preset"></label>
+                <label class="field small"><span>Right</span>
+                  <input type="number" id="adj-mright" step="0.01" min="0" placeholder="preset"></label>
+                <label class="field small"><span>Bottom</span>
+                  <input type="number" id="adj-mbottom" step="0.01" min="0" placeholder="preset"></label>
+                <label class="field small"><span>Left</span>
+                  <input type="number" id="adj-mleft" step="0.01" min="0" placeholder="preset"></label>
+              </div>
+
+              <h4>Orientation and scaling</h4>
+              <div class="row wrap">
+                <label class="field"><span>Orientation</span>
+                  <select id="adj-orientation">
+                    <option value="">Same as the preset</option>
+                    <option value="auto">Let the document decide</option>
+                    <option value="portrait">Portrait</option>
+                    <option value="landscape">Landscape</option>
+                    <option value="reverse-landscape">Reverse landscape</option>
+                  </select></label>
+                <label class="field"><span>Scaling</span>
+                  <select id="adj-scale">
+                    <option value="">Same as the preset</option>
+                    <option value="fit-to-page">Fit the printable area</option>
+                    <option value="actual">Actual size (may be cut off)</option>
+                  </select></label>
+                <label class="field small"><span>Density (dpi)</span>
+                  <input type="number" id="adj-density" min="0" max="2400" placeholder="preset"></label>
+              </div>
+              <div class="actions">
+                <button class="ghost" id="adjust-reset">Back to the preset</button>
+              </div>
+            </details>
+
+            <label class="field">
+              <span>Strategy <small>splits pages across printers</small></span>
+              <select id="print-strategy"></select>
+            </label>
+            <div class="row">
+              <label class="field small">
+                <span>Copies</span>
+                <input type="number" id="print-copies" min="1" max="1000" value="1">
+              </label>
+              <label class="field small">
+                <span>Pages</span>
+                <input type="text" id="print-pages" placeholder="all" spellcheck="false">
+              </label>
+              <label class="field small">
+                <span>Order</span>
+                <select id="print-order">
+                  <option value="normal">Document order</option>
+                  <option value="reverse">Reversed</option>
+                </select>
+              </label>
+            </div>
+            <p class="hint">Pages accepts <code>all</code>, <code>odd</code>, <code>even</code>,
+              <code>first</code>, <code>last</code>, <code>3</code>, <code>2-5</code>, <code>4-</code>,
+              <code>every:3</code> — or several, comma-separated. A strategy overrides this.</p>
+          </div>
+        </div>
+
+        <div class="col">
+          <div class="card">
+            <h2>3 · What will print</h2>
+            <div class="actions tight">
+              <button class="primary big" id="print-go" disabled>Print</button>
+              <button class="ghost" id="print-preview-btn" disabled>Refresh preview</button>
+              <button class="ghost" id="print-preflight-btn" disabled>Check fit</button>
+            </div>
+            <div id="print-result" class="result" hidden></div>
+
+            <div class="sheetview">
+              <div class="sheetview-head">
+                <div>
+                  <h3 class="sheetview-title">Actual print preview</h3>
+                  <p class="sheetview-sub" id="sheet-caption">Choose a printer and a file.</p>
+                </div>
+                <div class="pager" id="sheet-pager" hidden>
+                  <button class="ghost" id="page-prev" aria-label="Previous page">&#8249;</button>
+                  <span id="page-label">1 / 1</span>
+                  <button class="ghost" id="page-next" aria-label="Next page">&#8250;</button>
+                </div>
+              </div>
+
+              <div class="stage">
+                <p class="stage-empty" id="sheet-empty">The preview appears here once a file and a
+                  printer are chosen. It is drawn by the printer's own geometry, at the real
+                  proportions of the paper it has loaded.</p>
+                <figure class="paper" id="sheet-paper" hidden>
+                  <img id="preview-img" alt="The label as it will come out of the printer">
+                  <figcaption id="paper-dims"></figcaption>
+                </figure>
+                <div class="stage-busy" id="sheet-busy" hidden>drawing</div>
+              </div>
+
+              <div id="sheet-verdict" class="verdict" hidden></div>
+
+              <label class="check compact">
+                <input type="checkbox" id="sheet-guides" checked>
+                <span>Mark the paper edge, the printable area, and where this printer cannot
+                  reach</span>
+              </label>
+
+              <details class="tech" id="sheet-tech" hidden>
+                <summary>Technical details</summary>
+                <p class="muted">The geometry the print path resolved — the same numbers the job
+                  record carries. Points are what Java and the driver speak; inches are what a tape
+                  measure against the label reads.</p>
+                <dl class="facts" id="tech-facts"></dl>
+                <pre class="summary" id="preview-summary"></pre>
+              </details>
+            </div>
+
+            <details class="routing">
+              <summary>Where the pages go</summary>
+              <div id="print-plan" class="plan">
+                <p class="muted">Choose a printer to see the plan.</p>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ BULK -->
+    <section class="view" id="view-bulk" hidden>
+      <div class="viewhead">
+        <h1>Bulk print</h1>
+        <p class="sub">Every file is planned before any file prints. A run that cannot be carried
+          out is refused whole, rather than half-printed.</p>
+      </div>
+
+      <div class="card">
+        <div class="drop tall" id="bulk-drop">
+          <input type="file" id="bulk-files" accept="application/pdf,.pdf" multiple hidden>
+          <p><strong>Drop PDFs here</strong> — as many as you like — or
+            <button class="link" id="bulk-browse">choose files</button></p>
+          <p class="muted" id="bulk-staged-note">Files wait here on disk, not in memory.</p>
+        </div>
+        <div id="bulk-upload-progress" class="uploading" hidden></div>
+      </div>
+
+      <div class="card">
+        <div class="cardhead">
+          <h2>Staged files <span class="count" id="bulk-count">0</span></h2>
+          <div>
+            <button class="ghost" id="bulk-plan">Check the plan</button>
+            <button class="ghost danger" id="bulk-clear">Remove all</button>
+          </div>
+        </div>
+        <div class="tablewrap">
+          <table class="grid" id="bulk-table">
+            <thead><tr>
+              <th>File</th><th class="num">Pages</th><th class="num">Size</th>
+              <th>Shape</th><th>What will print</th><th></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Run</h2>
+        <div class="row wrap">
+          <label class="field">
+            <span>Strategy</span>
+            <select id="bulk-strategy"></select>
+          </label>
+          <label class="field">
+            <span>Printer <small>for rules that name none</small></span>
+            <select id="bulk-printer"></select>
+          </label>
+          <label class="field">
+            <span>Preset <small>for rules that name none</small></span>
+            <select id="bulk-preset"></select>
+          </label>
+          <label class="field small">
+            <span>Files at once</span>
+            <input type="number" id="bulk-concurrency" min="1" max="8" value="2">
+          </label>
+          <label class="field small">
+            <span>Copies ×</span>
+            <input type="number" id="bulk-copies" min="1" max="100" value="1">
+          </label>
+        </div>
+        <p class="hint">Two files at once matches the packing flow. More does not help a single
+          printer — jobs to one printer are always serialized, because a second writer garbles a
+          label — it helps when a strategy spreads pages across several printers.</p>
+        <div class="actions">
+          <button class="primary big" id="bulk-start">Start printing</button>
+          <button class="ghost danger" id="bulk-cancel" hidden>Cancel run</button>
+        </div>
+        <div id="bulk-plan-result" class="result" hidden></div>
+      </div>
+
+      <div class="card" id="bulk-progress-card" hidden>
+        <div class="cardhead">
+          <h2>Progress</h2>
+          <span class="pill" id="bulk-state"></span>
+        </div>
+        <div class="bar"><div class="bar-fill" id="bulk-bar"></div></div>
+        <p class="muted" id="bulk-counts"></p>
+        <div class="tablewrap">
+          <table class="grid" id="bulk-progress-table">
+            <thead><tr><th>File</th><th>State</th><th>Jobs</th><th>Detail</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="bulk-retry" hidden>Retry the failed files</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ PRINTERS -->
+    <section class="view" id="view-printers" hidden>
+      <div class="viewhead">
+        <h1>Printers</h1>
+        <p class="sub">Two kinds, and they work differently. <strong>Label</strong> printers take raw
+          commands over a network socket with no driver installed. <strong>Document</strong> printers
+          are whatever this computer already has, and a PDF is rasterised before it reaches them.</p>
+      </div>
+
+      <div class="card">
+        <div class="cardhead">
+          <h2>On this station</h2>
+          <button class="ghost" id="printers-refresh">Refresh</button>
+        </div>
+        <div class="tablewrap">
+          <table class="grid" id="printers-table">
+            <thead><tr>
+              <th>Printer</th><th>Lane</th><th>Status</th><th>Address</th>
+              <th class="num">Queue</th><th class="num">Printed</th><th class="num">Failed</th>
+              <th>Defined in</th><th></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 id="printer-form-title">Add a label printer</h2>
+        <p class="muted">A networked thermal printer, reached directly on its own port — usually 9100.
+          No driver, no spooler.</p>
+        <div class="row wrap">
+          <label class="field">
+            <span>Name <small>what a web app prints to</small></span>
+            <input type="text" id="pf-name" placeholder="pack-1" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>Host or IP</span>
+            <input type="text" id="pf-host" placeholder="192.168.1.40" spellcheck="false">
+          </label>
+          <label class="field small">
+            <span>Port</span>
+            <input type="number" id="pf-port" value="9100" min="1" max="65535">
+          </label>
+          <label class="field small">
+            <span>Charset</span>
+            <select id="pf-charset">
+              <option value="UTF-8">UTF-8</option>
+              <option value="windows-1252">windows-1252</option>
+              <option value="IBM437">IBM437 (CP437)</option>
+              <option value="IBM850">IBM850 (CP850)</option>
+              <option value="ISO-8859-1">ISO-8859-1</option>
+              <option value="Shift_JIS">Shift_JIS</option>
+              <option value="GBK">GBK</option>
+            </select>
+          </label>
+          <label class="field small">
+            <span>Line endings</span>
+            <select id="pf-lineending">
+              <option value="as-is">As-is</option>
+              <option value="crlf">CRLF</option>
+              <option value="lf">LF</option>
+            </select>
+          </label>
+          <label class="field grow">
+            <span>Note</span>
+            <input type="text" id="pf-note" placeholder="MRP + carton, left bench">
+          </label>
+        </div>
+        <p class="hint">If a printer ignores your commands, try <code>CRLF</code>. If non-ASCII text
+          comes out wrong, it is the charset — thermal printers are codepage-specific.</p>
+        <div class="actions">
+          <button class="ghost" id="pf-probe">Test the connection</button>
+          <button class="primary" id="pf-save">Save printer</button>
+          <button class="ghost" id="pf-reset" hidden>Cancel edit</button>
+        </div>
+        <div id="pf-result" class="result" hidden></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ PRESETS -->
+    <section class="view" id="view-presets" hidden>
+      <div class="viewhead">
+        <h1>Presets</h1>
+        <p class="sub">Paper geometry, saved. These numbers are calibrated against physical output —
+          a tidier value is a barcode the courier's scanner rejects, found out a day later.</p>
+      </div>
+
+      <div class="cols">
+        <div class="col narrow">
+          <div class="card">
+            <div class="cardhead">
+              <h2>Saved</h2>
+              <button class="ghost" id="preset-new">New</button>
+            </div>
+            <ul class="list" id="preset-list"></ul>
+          </div>
+        </div>
+        <div class="col">
+          <div class="card">
+            <h2 id="preset-form-title">New preset</h2>
+            <div class="row wrap">
+              <label class="field grow">
+                <span>Name</span>
+                <input type="text" id="ps-name" placeholder="Flipkart label 4x6">
+              </label>
+              <label class="field small">
+                <span>Copies</span>
+                <input type="number" id="ps-copies" min="1" max="1000" value="1">
+              </label>
+            </div>
+            <label class="field">
+              <span>Note <small>why these numbers are what they are</small></span>
+              <textarea id="ps-note" rows="2"></textarea>
+            </label>
+
+            <h3>Paper</h3>
+            <div class="row wrap">
+              <label class="field small"><span>Width</span>
+                <input type="number" id="ps-width" step="0.01" min="0"></label>
+              <label class="field small"><span>Height</span>
+                <input type="number" id="ps-height" step="0.01" min="0"></label>
+              <label class="field small"><span>Units</span>
+                <select id="ps-units">
+                  <option value="in">inches</option><option value="mm">mm</option>
+                  <option value="cm">cm</option><option value="pt">points</option>
+                </select></label>
+              <label class="field">
+                <span>Size means</span>
+                <select id="ps-sizemeans">
+                  <option value="">A rectangle on the loaded paper (safe)</option>
+                  <option value="sheet">The paper itself (QZ Tray's reading)</option>
+                </select>
+              </label>
+            </div>
+            <p class="hint" id="ps-sizemeans-hint">A rectangle on the loaded paper is the safe
+              reading: nothing can ask a thermal printer to feed stock it does not have. Only choose
+              "the paper itself" for a profile whose output was calibrated under QZ Tray.</p>
+
+            <h3>Margins</h3>
+            <div class="row wrap">
+              <label class="field small"><span>Top</span>
+                <input type="number" id="ps-mtop" step="0.01" min="0" value="0"></label>
+              <label class="field small"><span>Right</span>
+                <input type="number" id="ps-mright" step="0.01" min="0" value="0"></label>
+              <label class="field small"><span>Bottom</span>
+                <input type="number" id="ps-mbottom" step="0.01" min="0" value="0"></label>
+              <label class="field small"><span>Left</span>
+                <input type="number" id="ps-mleft" step="0.01" min="0" value="0"></label>
+            </div>
+            <p class="hint">Java gives every page a one-inch inset by default, so zero here means
+              genuine full bleed rather than a label crushed into the middle of the media.</p>
+
+            <h3>Rendering</h3>
+            <div class="row wrap">
+              <label class="field">
+                <span>Orientation</span>
+                <select id="ps-orientation">
+                  <option value="">Leave it to the document (auto)</option>
+                  <option value="portrait">Portrait</option>
+                  <option value="landscape">Landscape</option>
+                  <option value="reverse-landscape">Reverse landscape</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Colour</span>
+                <select id="ps-color">
+                  <option value="">Driver default</option>
+                  <option value="grayscale">Greyscale</option>
+                  <option value="color">Colour</option>
+                  <option value="blackwhite">Black and white</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Scaling</span>
+                <select id="ps-scale">
+                  <option value="">Driver default</option>
+                  <option value="actual">Actual size</option>
+                  <option value="fit">Shrink to fit</option>
+                  <option value="fit-to-page">Fit to page</option>
+                </select>
+              </label>
+              <label class="field small">
+                <span>Density (dpi)</span>
+                <input type="number" id="ps-density" min="0" max="2400" placeholder="0 = default">
+              </label>
+              <label class="field small">
+                <span>Page range</span>
+                <input type="text" id="ps-pagerange" placeholder="e.g. 1" spellcheck="false">
+              </label>
+            </div>
+            <p class="hint">Leaving orientation on <em>auto</em> is not laziness: a landscape invoice
+              that has to be rotated onto a portrait strip is detected from the PDF's own page box,
+              and forcing portrait here is what silently prints it upright.</p>
+
+            <div class="actions">
+              <button class="primary" id="ps-save">Save preset</button>
+              <button class="ghost" id="ps-preflight">Check fit on a printer</button>
+              <select id="ps-preflight-printer" class="inline-select"></select>
+              <button class="ghost danger" id="ps-delete" hidden>Delete</button>
+            </div>
+            <div id="ps-result" class="result" hidden></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ STRATEGIES -->
+    <section class="view" id="view-strategies" hidden>
+      <div class="viewhead">
+        <h1>Strategies</h1>
+        <p class="sub">Which pages go to which printer. This is the part you cannot do by picking a
+          printer and pressing Print: manual duplex, a label to one printer and its invoice to
+          another, the same page twice on two machines.</p>
+      </div>
+
+      <div class="cols">
+        <div class="col narrow">
+          <div class="card">
+            <div class="cardhead">
+              <h2>Saved</h2>
+              <button class="ghost" id="strategy-new">New</button>
+            </div>
+            <ul class="list" id="strategy-list"></ul>
+          </div>
+        </div>
+        <div class="col">
+          <div class="card">
+            <h2 id="strategy-form-title">New strategy</h2>
+            <label class="field">
+              <span>Name</span>
+              <input type="text" id="st-name" placeholder="Label left, invoice right">
+            </label>
+            <label class="field">
+              <span>Description</span>
+              <textarea id="st-description" rows="2"></textarea>
+            </label>
+
+            <h3>Rules <small>applied in order, all of them, to every document</small></h3>
+            <div class="tablewrap">
+              <table class="grid rules" id="st-rules">
+                <thead><tr>
+                  <th>On</th><th>Name</th><th>Pages</th><th>Order</th>
+                  <th>Printer</th><th>Preset</th><th class="num">Copies</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <button class="ghost" id="st-add-rule">Add a rule</button>
+
+            <h3>Try it</h3>
+            <div class="row">
+              <label class="field small">
+                <span>Against a document of</span>
+                <input type="number" id="st-try-pages" min="1" max="500" value="3">
+              </label>
+              <button class="ghost" id="st-try">Show what would print</button>
+            </div>
+            <div id="st-try-result" class="plan"></div>
+
+            <div class="actions">
+              <button class="primary" id="st-save">Save strategy</button>
+              <button class="ghost danger" id="st-delete" hidden>Delete</button>
+            </div>
+            <div id="st-result" class="result" hidden></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ JOBS -->
+    <section class="view" id="view-jobs" hidden>
+      <div class="viewhead">
+        <h1>Jobs</h1>
+        <p class="sub">What was sent, where, and whether the paper actually came out.</p>
+      </div>
+      <div class="card">
+        <div class="cardhead">
+          <h2>Recent</h2>
+          <div class="row">
+            <label class="field small inline">
+              <span>Show</span>
+              <select id="jobs-filter">
+                <option value="all">Everything</option>
+                <option value="failed">Failures only</option>
+                <option value="open">Still in flight</option>
+              </select>
+            </label>
+            <button class="ghost" id="jobs-refresh">Refresh</button>
+          </div>
+        </div>
+        <div class="tablewrap">
+          <table class="grid" id="jobs-table">
+            <thead><tr>
+              <th>When</th><th>What</th><th>Printer</th><th>Pages</th>
+              <th>State</th><th class="num">Took</th><th>Detail</th><th></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ SETTINGS -->
+    <section class="view" id="view-settings" hidden>
+      <div class="viewhead">
+        <h1>Settings</h1>
+        <p class="sub">What the panel starts with, and where to look when something is wrong.</p>
+      </div>
+
+      <div class="cols">
+        <div class="col">
+          <div class="card">
+            <h2>Panel defaults</h2>
+            <label class="field">
+              <span>Printer chosen on open</span>
+              <select id="set-printer"></select>
+            </label>
+            <label class="field">
+              <span>Preset chosen on open</span>
+              <select id="set-preset"></select>
+            </label>
+            <label class="field">
+              <span>Strategy chosen on open</span>
+              <select id="set-strategy"></select>
+            </label>
+            <div class="row wrap">
+              <label class="field small">
+                <span>Files at once, in bulk</span>
+                <input type="number" id="set-concurrency" min="1" max="8" value="2">
+              </label>
+              <label class="field small">
+                <span>Confirm wait (ms)</span>
+                <input type="number" id="set-wait" min="0" max="60000" step="500" value="12000">
+              </label>
+            </div>
+            <p class="hint">The confirm wait is an upper bound, not a delay: a job settles the moment
+              the printer finishes or refuses. Set it to 0 to stop waiting for confirmation at all —
+              faster, and you stop being told whether anything came out.</p>
+            <label class="check">
+              <input type="checkbox" id="set-autopreview" checked>
+              <span>Redraw the print preview automatically when settings change</span>
+            </label>
+            <p class="hint">On by default. Turn it off only if this station's printer is busy enough
+              that drawing a preview has to wait behind a print — the preview is rendered by the
+              printer's own lane, which is what makes it trustworthy.</p>
+            <div class="actions">
+              <button class="primary" id="set-save">Save defaults</button>
+            </div>
+            <div id="set-result" class="result" hidden></div>
+          </div>
+
+          <div class="card">
+            <h2>This station</h2>
+            <dl class="facts" id="station-facts"></dl>
+            <p class="hint">The port and the allowed origins live in <code>config.json</code>, which
+              is hand-edited on purpose: its comments are the record of why a station is set up the
+              way it is, and a screen that rewrote the file would delete them.</p>
+          </div>
+        </div>
+
+        <div class="col">
+          <div class="card">
+            <div class="cardhead">
+              <h2>Log</h2>
+              <div class="row">
+                <button class="ghost" id="log-refresh">Refresh</button>
+                <button class="ghost" id="log-copy">Copy</button>
+              </div>
+            </div>
+            <p class="muted">The packaged build has no console, so this is the only account of what a
+              driver actually did.</p>
+            <pre class="log" id="log-body">…</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>
